@@ -1,0 +1,12 @@
+{
+  "name": "xauusd-trading-signals-bot",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0",
+    "express": "^5.1.0"
+  }
+}
