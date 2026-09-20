@@ -15,6 +15,39 @@ const bot = new TelegramBot(token, {
   polling: true
 });
 
+app.use(express.urlencoded({ extended: true }));
+
+
+// ===============================
+// ADMIN PANEL LOGIN
+// ===============================
+// Set these in Render's Environment Variables tab. If you don't set
+// them, the panel falls back to admin / changeme123 - change that
+// immediately if you leave it on the default.
+// ===============================
+
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme123";
+
+function requireAdminAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Basic ")) {
+    res.set("WWW-Authenticate", 'Basic realm="Admin Panel"');
+    return res.status(401).send("Authentication required.");
+  }
+
+  const decoded = Buffer.from(authHeader.split(" ")[1], "base64").toString();
+  const [user, pass] = decoded.split(":");
+
+  if (user === ADMIN_USER && pass === ADMIN_PASSWORD) {
+    return next();
+  }
+
+  res.set("WWW-Authenticate", 'Basic realm="Admin Panel"');
+  return res.status(401).send("Invalid credentials.");
+}
+
 
 // ===============================
 // BOT MENU
@@ -36,8 +69,21 @@ const mainMenu = {
 // ===============================
 // USERS SUBSCRIBED TO AUTO SIGNALS
 // ===============================
+// Map instead of a Set so the admin panel can show who each
+// subscriber actually is, not just their raw chat ID.
+// ===============================
 
-const subscribers = new Set();
+const subscribers = new Map(); // chatId -> { username, firstName, joinedAt }
+
+
+// ===============================
+// SIGNAL HISTORY (for the admin panel)
+// ===============================
+
+const signalHistory = []; // most recent first
+const MAX_SIGNAL_HISTORY = 100;
+
+const botStartedAt = Date.now();
 
 
 // ===============================
@@ -46,6 +92,154 @@ const subscribers = new Set();
 
 app.get("/", (req, res) => {
   res.send("🔥 MONEY MAKING MACHINE BOT is running.");
+});
+
+
+// ===============================
+// ADMIN PANEL
+// ===============================
+// Open https://your-render-url.onrender.com/admin in any phone
+// browser. It will prompt for a username/password - that's the
+// ADMIN_USER / ADMIN_PASSWORD you set in Render's environment
+// variables.
+//
+// NOTE: everything here lives in memory, same as the bot's candle
+// data. A restart (or Render free-tier spin-down) clears history
+// and the subscriber list rebuilds itself as people interact again.
+// ===============================
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function formatUptime(ms) {
+  const totalMinutes = Math.floor(ms / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${minutes}m`;
+}
+
+app.get("/admin", requireAdminAuth, (req, res) => {
+
+  const price = candles.length > 0 ? candles[candles.length - 1].close : null;
+
+  const subscriberRows = [...subscribers.entries()].map(([chatId, info]) => `
+    <tr>
+      <td>${escapeHtml(info.firstName)}${info.username ? " (@" + escapeHtml(info.username) + ")" : ""}</td>
+      <td>${chatId}</td>
+      <td>${new Date(info.joinedAt).toLocaleString()}</td>
+      <td>
+        <form method="POST" action="/admin/remove" style="margin:0;">
+          <input type="hidden" name="chatId" value="${chatId}">
+          <button type="submit" class="danger">Remove</button>
+        </form>
+      </td>
+    </tr>
+  `).join("") || `<tr><td colspan="4">No subscribers yet.</td></tr>`;
+
+  const signalRows = signalHistory.slice(0, 20).map(s => `
+    <tr>
+      <td>${new Date(s.time).toLocaleString()}</td>
+      <td>${s.label}</td>
+      <td>${s.direction}</td>
+      <td>${s.entryPrice.toFixed(2)}</td>
+      <td>${s.stopLoss.toFixed(2)}</td>
+      <td>${s.takeProfit.toFixed(2)}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="6">No signals fired yet.</td></tr>`;
+
+  const setupStatus = pendingSetup
+    ? `Watching a ${escapeHtml(pendingSetup.label)} ${escapeHtml(pendingSetup.direction.toUpperCase())} setup, waiting for retest.`
+    : "No active setup right now.";
+
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Money Making Machine - Admin</title>
+      <style>
+        body { font-family: -apple-system, Arial, sans-serif; background: #0f1115; color: #eee; margin: 0; padding: 16px; }
+        h1 { font-size: 1.3rem; }
+        h2 { font-size: 1.05rem; margin-top: 28px; color: #f5c542; }
+        .stats { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+        .card { background: #1b1f27; border-radius: 10px; padding: 12px 16px; flex: 1 1 140px; }
+        .card .label { font-size: 0.75rem; color: #999; }
+        .card .value { font-size: 1.3rem; font-weight: bold; margin-top: 4px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.85rem; }
+        th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #2a2f3a; }
+        th { color: #aaa; font-weight: normal; }
+        button { background: #2b6fe0; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-size: 0.85rem; }
+        button.danger { background: #c0392b; }
+        textarea, input[type=text] { width: 100%; box-sizing: border-box; background: #1b1f27; color: #eee; border: 1px solid #333; border-radius: 6px; padding: 8px; font-size: 0.9rem; }
+        form.broadcast { margin-top: 8px; }
+        .scroll { overflow-x: auto; }
+      </style>
+    </head>
+    <body>
+      <h1>🔥 Money Making Machine - Admin</h1>
+
+      <div class="stats">
+        <div class="card"><div class="label">Bot uptime</div><div class="value">${formatUptime(Date.now() - botStartedAt)}</div></div>
+        <div class="card"><div class="label">Live price</div><div class="value">${price ? price.toFixed(2) : "—"}</div></div>
+        <div class="card"><div class="label">Candles</div><div class="value">${candles.length}</div></div>
+        <div class="card"><div class="label">Subscribers</div><div class="value">${subscribers.size}</div></div>
+        <div class="card"><div class="label">Signals sent</div><div class="value">${signalHistory.length}</div></div>
+      </div>
+
+      <p><strong>Setup status:</strong> ${setupStatus}</p>
+
+      <h2>Send a manual message to all subscribers</h2>
+      <form class="broadcast" method="POST" action="/admin/broadcast">
+        <textarea name="message" rows="3" placeholder="Type a message to send to every subscriber..."></textarea>
+        <br><br>
+        <button type="submit">Send Broadcast</button>
+      </form>
+
+      <h2>Subscribers (${subscribers.size})</h2>
+      <div class="scroll">
+        <table>
+          <tr><th>Name</th><th>Chat ID</th><th>Joined</th><th></th></tr>
+          ${subscriberRows}
+        </table>
+      </div>
+
+      <h2>Recent Signals</h2>
+      <div class="scroll">
+        <table>
+          <tr><th>Time</th><th>Type</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP</th></tr>
+          ${signalRows}
+        </table>
+      </div>
+
+    </body>
+    </html>
+  `);
+
+});
+
+app.post("/admin/remove", requireAdminAuth, (req, res) => {
+  const chatId = Number(req.body.chatId);
+  subscribers.delete(chatId);
+  res.redirect("/admin");
+});
+
+app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
+  const text = (req.body.message || "").trim();
+
+  if (text) {
+    for (const chatId of subscribers.keys()) {
+      bot.sendMessage(chatId, `📢 ${text}`).catch(err => {
+        console.error(`Broadcast failed for ${chatId}:`, err.message);
+      });
+    }
+  }
+
+  res.redirect("/admin");
 });
 
 
@@ -339,7 +533,17 @@ ${emoji} ${direction} @ ${entryPrice.toFixed(2)}
 
   console.log(`[SIGNAL FIRED] ${direction} @ ${entryPrice}`);
 
-  for (const chatId of subscribers) {
+  signalHistory.unshift({
+    time: Date.now(),
+    label: setup.label,
+    direction,
+    entryPrice,
+    stopLoss,
+    takeProfit
+  });
+  if (signalHistory.length > MAX_SIGNAL_HISTORY) signalHistory.pop();
+
+  for (const chatId of subscribers.keys()) {
     bot.sendMessage(chatId, message).catch(err => {
       console.error(`Failed to send signal to ${chatId}:`, err.message);
     });
@@ -469,7 +673,11 @@ ${status}
 
   if (msg.text === "🔔 Auto Signals") {
 
-    subscribers.add(msg.chat.id);
+    subscribers.set(msg.chat.id, {
+      username: msg.from.username || null,
+      firstName: msg.from.first_name || "Unknown",
+      joinedAt: subscribers.has(msg.chat.id) ? subscribers.get(msg.chat.id).joinedAt : Date.now()
+    });
 
     bot.sendMessage(
       msg.chat.id,
