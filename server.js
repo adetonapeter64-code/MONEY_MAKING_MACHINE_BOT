@@ -141,6 +141,8 @@ app.get("/admin", requireAdminAuth, (req, res) => {
     </tr>
   `).join("") || `<tr><td colspan="4">No subscribers yet.</td></tr>`;
 
+  const statusBadge = { open: "⏳ Open", win: "✅ Win", loss: "❌ Loss" };
+
   const signalRows = signalHistory.slice(0, 20).map(s => `
     <tr>
       <td>${new Date(s.time).toLocaleString()}</td>
@@ -149,8 +151,15 @@ app.get("/admin", requireAdminAuth, (req, res) => {
       <td>${s.entryPrice.toFixed(2)}</td>
       <td>${s.stopLoss.toFixed(2)}</td>
       <td>${s.takeProfit.toFixed(2)}</td>
+      <td>${statusBadge[s.status] || s.status}</td>
     </tr>
-  `).join("") || `<tr><td colspan="6">No signals fired yet.</td></tr>`;
+  `).join("") || `<tr><td colspan="7">No signals fired yet.</td></tr>`;
+
+  const wins = signalHistory.filter(s => s.status === "win").length;
+  const losses = signalHistory.filter(s => s.status === "loss").length;
+  const openCount = signalHistory.filter(s => s.status === "open").length;
+  const decided = wins + losses;
+  const winRate = decided > 0 ? ((wins / decided) * 100).toFixed(1) : "—";
 
   const setupStatus = pendingSetup
     ? `Watching a ${escapeHtml(pendingSetup.label)} ${escapeHtml(pendingSetup.direction.toUpperCase())} setup, waiting for retest.`
@@ -191,6 +200,13 @@ app.get("/admin", requireAdminAuth, (req, res) => {
         <div class="card"><div class="label">Signals sent</div><div class="value">${signalHistory.length}</div></div>
       </div>
 
+      <div class="stats">
+        <div class="card"><div class="label">Win rate</div><div class="value">${winRate}${decided > 0 ? "%" : ""}</div></div>
+        <div class="card"><div class="label">Wins</div><div class="value">${wins}</div></div>
+        <div class="card"><div class="label">Losses</div><div class="value">${losses}</div></div>
+        <div class="card"><div class="label">Open</div><div class="value">${openCount}</div></div>
+      </div>
+
       <p><strong>Setup status:</strong> ${setupStatus}</p>
 
       <h2>Send a manual message to all subscribers</h2>
@@ -211,7 +227,7 @@ app.get("/admin", requireAdminAuth, (req, res) => {
       <h2>Recent Signals</h2>
       <div class="scroll">
         <table>
-          <tr><th>Time</th><th>Type</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP</th></tr>
+          <tr><th>Time</th><th>Type</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP</th><th>Result</th></tr>
           ${signalRows}
         </table>
       </div>
@@ -387,7 +403,7 @@ function findOrderBlock(breakIndex, direction) {
 
 let pendingSetup = null; // { direction, label, fvg, orderBlock, breakLevel, createdAt }
 let lastSignalTime = 0;
-const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000; // don't spam - 30 min minimum between signals
+const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000; // rest period after a signal closes before hunting resumes
 const SETUP_EXPIRY_MS = 3 * 60 * 60 * 1000; // drop an unconfirmed setup after 3 hours
 
 const PIP_SIZE = 0.1; // XAUUSD convention used here: 1 "pip" = $0.10 move
@@ -399,8 +415,18 @@ const TP_PIPS_MAX = 300;
 // MAIN ANALYSIS - runs every time a new 5-minute candle closes
 // ================================================================
 
+function hasOpenSignal() {
+  return signalHistory.some(s => s.status === "open");
+}
+
 function analyzeMarket() {
   if (candles.length < 20) return; // not enough history yet
+
+  // Strict one-at-a-time rule: never hunt for a new setup while a
+  // previous signal is still running. Wait for it to hit TP or SL
+  // (checkOpenSignals handles that), send the result, THEN resume
+  // scanning. This keeps the bot from ever overlapping trades.
+  if (hasOpenSignal()) return;
 
   const swings = findSwings(2);
   if (swings.length < 4) return;
@@ -534,12 +560,16 @@ ${emoji} ${direction} @ ${entryPrice.toFixed(2)}
   console.log(`[SIGNAL FIRED] ${direction} @ ${entryPrice}`);
 
   signalHistory.unshift({
+    id: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
     time: Date.now(),
     label: setup.label,
     direction,
     entryPrice,
     stopLoss,
-    takeProfit
+    takeProfit,
+    status: "open",      // open -> win / loss once price hits TP or SL
+    closedAt: null,
+    closePrice: null
   });
   if (signalHistory.length > MAX_SIGNAL_HISTORY) signalHistory.pop();
 
@@ -547,6 +577,72 @@ ${emoji} ${direction} @ ${entryPrice.toFixed(2)}
     bot.sendMessage(chatId, message).catch(err => {
       console.error(`Failed to send signal to ${chatId}:`, err.message);
     });
+  }
+}
+
+
+// ================================================================
+// OUTCOME TRACKER
+// ================================================================
+// Runs on every price tick (every 30 seconds). Checks every still-
+// open signal against the current live price - if price has hit
+// either the Take Profit or Stop Loss, the signal is marked as a
+// win or a loss and everyone subscribed gets notified.
+// ================================================================
+
+function checkOpenSignals(currentPrice) {
+
+  const openSignals = signalHistory.filter(s => s.status === "open");
+
+  for (const signal of openSignals) {
+
+    let hitTP = false;
+    let hitSL = false;
+
+    if (signal.direction === "BUY") {
+      hitTP = currentPrice >= signal.takeProfit;
+      hitSL = currentPrice <= signal.stopLoss;
+    } else {
+      hitTP = currentPrice <= signal.takeProfit;
+      hitSL = currentPrice >= signal.stopLoss;
+    }
+
+    // If both somehow trip on the same tick (fast spike/wick), treat
+    // the Stop Loss as hit first - the more conservative outcome.
+    if (hitSL) {
+      signal.status = "loss";
+    } else if (hitTP) {
+      signal.status = "win";
+    } else {
+      continue; // still open, nothing to do
+    }
+
+    signal.closedAt = Date.now();
+    signal.closePrice = currentPrice;
+
+    // Cooldown now counts from when THIS signal closed, not when it
+    // opened - guarantees a clean rest period after every result
+    // before the bot starts hunting for the next setup.
+    lastSignalTime = Date.now();
+
+    const resultEmoji = signal.status === "win" ? "✅" : "❌";
+    const resultText = signal.status === "win" ? "TAKE PROFIT HIT" : "STOP LOSS HIT";
+
+    const closeMessage =
+`${resultEmoji} SIGNAL CLOSED - ${resultText}
+
+${signal.direction} @ ${signal.entryPrice.toFixed(2)}
+Closed @ ${currentPrice.toFixed(2)}
+
+${signal.status === "win" ? "🎯 Target reached." : "🛡️ Stop loss protected your downside."}`;
+
+    console.log(`[SIGNAL CLOSED] ${signal.direction} @ ${signal.entryPrice} -> ${signal.status.toUpperCase()} @ ${currentPrice}`);
+
+    for (const chatId of subscribers.keys()) {
+      bot.sendMessage(chatId, closeMessage).catch(err => {
+        console.error(`Failed to send close update to ${chatId}:`, err.message);
+      });
+    }
   }
 }
 
@@ -825,6 +921,7 @@ async function monitorMarket() {
     );
 
     addTick(price);
+    checkOpenSignals(price);
 
   } catch (error) {
 
