@@ -419,6 +419,33 @@ function hasOpenSignal() {
   return signalHistory.some(s => s.status === "open");
 }
 
+// ================================================================
+// SETUP RUNNING NOTIFICATION
+// ================================================================
+// Fires once, the moment a setup is first detected (BOS/CHoCH + FVG
+// found) - before it's actually confirmed and traded. Lets you know
+// something is being watched, separate from the final entry signal.
+// ================================================================
+
+function notifySetupRunning(setup) {
+  const directionLabel = setup.direction === "bullish" ? "BUY" : "SELL";
+
+  const message =
+`🟢 XAUUSD SETUP IS RUNNING
+
+A ${setup.label} has been detected (${directionLabel} bias).
+
+👀 Watching for price to retrace into the zone with a confirming candle before sending the actual entry signal.
+
+This is a heads-up, not an entry yet.`;
+
+  for (const chatId of subscribers.keys()) {
+    bot.sendMessage(chatId, message).catch(err => {
+      console.error(`Failed to send setup-running notice to ${chatId}:`, err.message);
+    });
+  }
+}
+
 function analyzeMarket() {
   if (candles.length < 20) return; // not enough history yet
 
@@ -466,6 +493,7 @@ function analyzeMarket() {
         createdAt: Date.now()
       };
       console.log(`[SETUP] Bullish ${pendingSetup.label} detected @ ${latestClose}`);
+      notifySetupRunning(pendingSetup);
     }
   }
 
@@ -482,6 +510,7 @@ function analyzeMarket() {
         createdAt: Date.now()
       };
       console.log(`[SETUP] Bearish ${pendingSetup.label} detected @ ${latestClose}`);
+      notifySetupRunning(pendingSetup);
     }
   }
 
@@ -653,6 +682,16 @@ ${signal.status === "win" ? "🎯 Target reached." : "🛡️ Stop loss protecte
 
 bot.onText(/\/start/, (msg) => {
 
+  // Auto-subscribe on /start - no need to tap "Auto Signals" separately.
+  // (Note: since subscriber data lives in memory, this re-subscribes
+  // automatically whenever the bot restarts too, since you'll likely
+  // send /start again after checking on it.)
+  subscribers.set(msg.chat.id, {
+    username: msg.from.username || null,
+    firstName: msg.from.first_name || "Unknown",
+    joinedAt: subscribers.has(msg.chat.id) ? subscribers.get(msg.chat.id).joinedAt : Date.now()
+  });
+
   bot.sendMessage(
     msg.chat.id,
 
@@ -666,6 +705,8 @@ Your XAUUSD trading assistant.
 🚨 Entry alerts
 🎯 200–300 pip targets
 🛡️ Risk levels
+
+🔔 Auto Signals is ON by default - you're already subscribed, no need to tap anything.
 
 Choose an option below:`,
     mainMenu
