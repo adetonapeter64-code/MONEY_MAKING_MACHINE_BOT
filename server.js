@@ -297,14 +297,29 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
 // GET LIVE XAUUSD PRICE
 // ===============================
 
-// Sources are tried in order. If the first one fails (down, blocked,
-// rate-limited, bad data), the bot automatically moves to the next.
-// Each failure is logged with the reason so it shows up in Render's Logs.
+// Sources are tried in order. If one fails (down, blocked, rate-limited,
+// bad data), the bot moves to the next AND pauses the failed source for
+// a few minutes so it isn't hammered while it's having problems (this is
+// what avoids repeated HTTP 429 rate-limit errors). Every failure is
+// logged with its reason in Render's Logs tab.
 const PRICE_SOURCES = [
   {
     name: "xaus.com",
     url: "https://xaus.com/api/v1/spot?compact=1",
     parse: (data) => Number(data && data.xau && data.xau.price)
+  },
+  {
+    name: "gold-api.com",
+    url: "https://api.gold-api.com/price/XAU",
+    parse: (data) => Number(data && data.price)
+  },
+  {
+    name: "swissquote",
+    url: "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
+    parse: (data) => {
+      const p = data && data[0] && data[0].spreadProfilePrices && data[0].spreadProfilePrices[0];
+      return p ? (Number(p.bid) + Number(p.ask)) / 2 : NaN;
+    }
   },
   {
     name: "goldprice.dev",
@@ -313,11 +328,29 @@ const PRICE_SOURCES = [
   }
 ];
 
+PRICE_SOURCES.forEach(s => { s.skipUntil = 0; });
+
+const PAUSE_AFTER_ERROR_MS = 2 * 60 * 1000;
+const PAUSE_AFTER_RATE_LIMIT_MS = 10 * 60 * 1000;
+
+// Short cache so button taps don't add extra API calls
+let lastPrice = { value: null, time: 0, source: null };
+const PRICE_CACHE_MS = 15000;
+
 async function getGoldPrice() {
+
+  if (lastPrice.value && Date.now() - lastPrice.time < PRICE_CACHE_MS) {
+    return lastPrice.value;
+  }
+
+  let candidates = PRICE_SOURCES.filter(s => Date.now() >= s.skipUntil);
+
+  // If every source is paused, try them all again rather than give up
+  if (candidates.length === 0) candidates = PRICE_SOURCES;
 
   const failures = [];
 
-  for (const source of PRICE_SOURCES) {
+  for (const source of candidates) {
 
     try {
 
@@ -336,15 +369,22 @@ async function getGoldPrice() {
         throw new Error("Invalid price data");
       }
 
+      if (lastPrice.source !== source.name) {
+        console.log(`[PRICE] Now using ${source.name}`);
+      }
+
+      lastPrice = { value: price, time: Date.now(), source: source.name };
       return price;
 
     } catch (error) {
 
-      const reason = error.response
-        ? `HTTP ${error.response.status}`
-        : error.message;
+      const status = error.response ? error.response.status : null;
+      const reason = status ? `HTTP ${status}` : error.message;
+      const pauseMs = status === 429 ? PAUSE_AFTER_RATE_LIMIT_MS : PAUSE_AFTER_ERROR_MS;
 
-      console.error(`[PRICE] ${source.name} failed: ${reason}`);
+      source.skipUntil = Date.now() + pauseMs;
+
+      console.error(`[PRICE] ${source.name} failed: ${reason} (paused ${pauseMs / 60000} min)`);
       failures.push(`${source.name}: ${reason}`);
 
     }
@@ -1005,6 +1045,24 @@ setInterval(
 // ===============================
 
 monitorMarket();
+
+
+// ===============================
+// CLEAN SHUTDOWN
+// ===============================
+// When Render redeploys, it tells the old copy to stop. Stopping
+// Telegram polling cleanly first avoids the "409 Conflict" error
+// caused by two copies of the bot polling at the same time.
+// ===============================
+
+process.on("SIGTERM", async () => {
+  try {
+    await bot.stopPolling();
+  } catch (err) {
+    console.error("Error stopping polling:", err.message);
+  }
+  process.exit(0);
+});
 
 
 // ===============================
