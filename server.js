@@ -297,22 +297,61 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
 // GET LIVE XAUUSD PRICE
 // ===============================
 
+// Sources are tried in order. If the first one fails (down, blocked,
+// rate-limited, bad data), the bot automatically moves to the next.
+// Each failure is logged with the reason so it shows up in Render's Logs.
+const PRICE_SOURCES = [
+  {
+    name: "xaus.com",
+    url: "https://xaus.com/api/v1/spot?compact=1",
+    parse: (data) => Number(data && data.xau && data.xau.price)
+  },
+  {
+    name: "goldprice.dev",
+    url: "https://api.goldprice.dev/v1/prices?symbol=XAU-USD-SPOT",
+    parse: (data) => Number(data && data.symbols && data.symbols[0] && data.symbols[0].price)
+  }
+];
+
 async function getGoldPrice() {
 
-  const response = await axios.get(
-    "https://xaus.com/api/v1/spot?compact=1",
-    {
-      timeout: 10000
+  const failures = [];
+
+  for (const source of PRICE_SOURCES) {
+
+    try {
+
+      const response = await axios.get(source.url, {
+        timeout: 10000,
+        headers: {
+          // Some APIs block axios's default user agent
+          "User-Agent": "Mozilla/5.0 (compatible; MoneyMakingMachineBot/1.0)",
+          "Accept": "application/json"
+        }
+      });
+
+      const price = source.parse(response.data);
+
+      if (!Number.isFinite(price) || price <= 0) {
+        throw new Error("Invalid price data");
+      }
+
+      return price;
+
+    } catch (error) {
+
+      const reason = error.response
+        ? `HTTP ${error.response.status}`
+        : error.message;
+
+      console.error(`[PRICE] ${source.name} failed: ${reason}`);
+      failures.push(`${source.name}: ${reason}`);
+
     }
-  );
 
-  const data = response.data;
-
-  if (!data.xau || !data.xau.price) {
-    throw new Error("Invalid XAUUSD data");
   }
 
-  return Number(data.xau.price);
+  throw new Error(`All price sources failed (${failures.join(" | ")})`);
 }
 
 
