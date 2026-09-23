@@ -3,11 +3,12 @@ const express = require("express");
 const axios = require("axios");
 
 const app = express();
+
 const PORT = process.env.PORT || 3000;
 const token = process.env.BOT_TOKEN;
 
 if (!token) {
-  console.error("BOT_TOKEN is missing");
+  console.error("❌ BOT_TOKEN is missing");
   process.exit(1);
 }
 
@@ -16,48 +17,55 @@ const bot = new TelegramBot(token, {
 });
 
 app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
+/* =========================================================
+   BOT SETTINGS
+========================================================= */
 
-// ===============================
-// ADMIN PANEL LOGIN
-// ===============================
-// Set these in Render's Environment Variables tab. If you don't set
-// them, the panel falls back to admin / changeme123 - change that
-// immediately if you leave it on the default.
-// ===============================
+const BOT_NAME = "MONEY MAKING MACHINE BOT";
+const SYMBOL = "XAUUSD";
+
+const PIP_SIZE = 0.1;
+
+const TP_PIPS_MIN = 200;
+const TP_PIPS_MAX = 300;
+
+const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
+const SETUP_EXPIRY_MS = 3 * 60 * 60 * 1000;
+
+const TICKS_PER_CANDLE = 10;
+const MAX_CANDLES = 300;
 
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme123";
 
-function requireAdminAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
+/* =========================================================
+   DATA
+========================================================= */
 
-  if (!authHeader || !authHeader.startsWith("Basic ")) {
-    res.set("WWW-Authenticate", 'Basic realm="Admin Panel"');
-    return res.status(401).send("Authentication required.");
-  }
+const subscribers = new Map();
 
-  const decoded = Buffer.from(authHeader.split(" ")[1], "base64").toString();
-  const [user, pass] = decoded.split(":");
+const signalHistory = [];
+const MAX_SIGNAL_HISTORY = 100;
 
-  if (user === ADMIN_USER && pass === ADMIN_PASSWORD) {
-    return next();
-  }
+const botStartedAt = Date.now();
 
-  res.set("WWW-Authenticate", 'Basic realm="Admin Panel"');
-  return res.status(401).send("Invalid credentials.");
-}
+let candles = [];
+let currentTicks = [];
 
+let pendingSetup = null;
+let lastSignalTime = 0;
 
-// ===============================
-// BOT MENU
-// ===============================
+/* =========================================================
+   TELEGRAM MENU
+========================================================= */
 
 const mainMenu = {
   reply_markup: {
     keyboard: [
       ["📊 XAUUSD Signal", "💰 Live Price"],
-      ["🔔 Auto Signals", "🔕 Stop Alerts"],
+      ["🔕 Stop Alerts"],
       ["📖 How It Works", "⚙️ Settings"]
     ],
     resize_keyboard: true,
@@ -65,242 +73,54 @@ const mainMenu = {
   }
 };
 
+/* =========================================================
+   FORMATTERS
+========================================================= */
 
-// ===============================
-// USERS SUBSCRIBED TO AUTO SIGNALS
-// ===============================
-// Map instead of a Set so the admin panel can show who each
-// subscriber actually is, not just their raw chat ID.
-// ===============================
-
-const subscribers = new Map(); // chatId -> { username, firstName, joinedAt }
-
-
-// ===============================
-// SIGNAL HISTORY (for the admin panel)
-// ===============================
-
-const signalHistory = []; // most recent first
-const MAX_SIGNAL_HISTORY = 100;
-
-const botStartedAt = Date.now();
-
-
-// ===============================
-// WEB SERVER
-// ===============================
-
-app.get("/", (req, res) => {
-  res.send("🔥 MONEY MAKING MACHINE BOT is running.");
-});
-
-
-// ===============================
-// ADMIN PANEL
-// ===============================
-// Open https://your-render-url.onrender.com/admin in any phone
-// browser. It will prompt for a username/password - that's the
-// ADMIN_USER / ADMIN_PASSWORD you set in Render's environment
-// variables.
-//
-// NOTE: everything here lives in memory, same as the bot's candle
-// data. A restart (or Render free-tier spin-down) clears history
-// and the subscriber list rebuilds itself as people interact again.
-// ===============================
-
-function escapeHtml(str) {
-  if (str === null || str === undefined) return "";
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+function formatPrice(price) {
+  return Number(price).toFixed(2);
 }
 
-function formatUptime(ms) {
-  const totalMinutes = Math.floor(ms / 60000);
-  const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return `${hours}h ${minutes}m`;
+function formatTime(timestamp) {
+  return new Date(timestamp).toLocaleString("en-NG", {
+    timeZone: "Africa/Lagos"
+  });
 }
 
-app.get("/admin", requireAdminAuth, (req, res) => {
-
-  const price = candles.length > 0 ? candles[candles.length - 1].close : null;
-
-  const subscriberRows = [...subscribers.entries()].map(([chatId, info]) => `
-    <tr>
-      <td>${escapeHtml(info.firstName)}${info.username ? " (@" + escapeHtml(info.username) + ")" : ""}</td>
-      <td>${chatId}</td>
-      <td>${new Date(info.joinedAt).toLocaleString()}</td>
-      <td>
-        <form method="POST" action="/admin/remove" style="margin:0;">
-          <input type="hidden" name="chatId" value="${chatId}">
-          <button type="submit" class="danger">Remove</button>
-        </form>
-      </td>
-    </tr>
-  `).join("") || `<tr><td colspan="4">No subscribers yet.</td></tr>`;
-
-  const statusBadge = { open: "⏳ Open", win: "✅ Win", loss: "❌ Loss" };
-
-  const signalRows = signalHistory.slice(0, 20).map(s => `
-    <tr>
-      <td>${new Date(s.time).toLocaleString()}</td>
-      <td>${s.label}</td>
-      <td>${s.direction}</td>
-      <td>${s.entryPrice.toFixed(2)}</td>
-      <td>${s.stopLoss.toFixed(2)}</td>
-      <td>${s.takeProfit.toFixed(2)}</td>
-      <td>${statusBadge[s.status] || s.status}</td>
-    </tr>
-  `).join("") || `<tr><td colspan="7">No signals fired yet.</td></tr>`;
-
-  const wins = signalHistory.filter(s => s.status === "win").length;
-  const losses = signalHistory.filter(s => s.status === "loss").length;
-  const openCount = signalHistory.filter(s => s.status === "open").length;
-  const decided = wins + losses;
-  const winRate = decided > 0 ? ((wins / decided) * 100).toFixed(1) : "—";
-
-  const setupStatus = pendingSetup
-    ? `Watching a ${escapeHtml(pendingSetup.label)} ${escapeHtml(pendingSetup.direction.toUpperCase())} setup, waiting for retest.`
-    : "No active setup right now.";
-
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <title>Money Making Machine - Admin</title>
-      <style>
-        body { font-family: -apple-system, Arial, sans-serif; background: #0f1115; color: #eee; margin: 0; padding: 16px; }
-        h1 { font-size: 1.3rem; }
-        h2 { font-size: 1.05rem; margin-top: 28px; color: #f5c542; }
-        .stats { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
-        .card { background: #1b1f27; border-radius: 10px; padding: 12px 16px; flex: 1 1 140px; }
-        .card .label { font-size: 0.75rem; color: #999; }
-        .card .value { font-size: 1.3rem; font-weight: bold; margin-top: 4px; }
-        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.85rem; }
-        th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #2a2f3a; }
-        th { color: #aaa; font-weight: normal; }
-        button { background: #2b6fe0; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-size: 0.85rem; }
-        button.danger { background: #c0392b; }
-        textarea, input[type=text] { width: 100%; box-sizing: border-box; background: #1b1f27; color: #eee; border: 1px solid #333; border-radius: 6px; padding: 8px; font-size: 0.9rem; }
-        form.broadcast { margin-top: 8px; }
-        .scroll { overflow-x: auto; }
-      </style>
-    </head>
-    <body>
-      <h1>🔥 Money Making Machine - Admin</h1>
-
-      <div class="stats">
-        <div class="card"><div class="label">Bot uptime</div><div class="value">${formatUptime(Date.now() - botStartedAt)}</div></div>
-        <div class="card"><div class="label">Live price</div><div class="value">${price ? price.toFixed(2) : "—"}</div></div>
-        <div class="card"><div class="label">Candles</div><div class="value">${candles.length}</div></div>
-        <div class="card"><div class="label">Subscribers</div><div class="value">${subscribers.size}</div></div>
-        <div class="card"><div class="label">Signals sent</div><div class="value">${signalHistory.length}</div></div>
-      </div>
-
-      <div class="stats">
-        <div class="card"><div class="label">Win rate</div><div class="value">${winRate}${decided > 0 ? "%" : ""}</div></div>
-        <div class="card"><div class="label">Wins</div><div class="value">${wins}</div></div>
-        <div class="card"><div class="label">Losses</div><div class="value">${losses}</div></div>
-        <div class="card"><div class="label">Open</div><div class="value">${openCount}</div></div>
-      </div>
-
-      <p><strong>Setup status:</strong> ${setupStatus}</p>
-
-      <h2>Send a manual message to all subscribers</h2>
-      <form class="broadcast" method="POST" action="/admin/broadcast">
-        <textarea name="message" rows="3" placeholder="Type a message to send to every subscriber..."></textarea>
-        <br><br>
-        <button type="submit">Send Broadcast</button>
-      </form>
-
-      <h2>Subscribers (${subscribers.size})</h2>
-      <div class="scroll">
-        <table>
-          <tr><th>Name</th><th>Chat ID</th><th>Joined</th><th></th></tr>
-          ${subscriberRows}
-        </table>
-      </div>
-
-      <h2>Recent Signals</h2>
-      <div class="scroll">
-        <table>
-          <tr><th>Time</th><th>Type</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP</th><th>Result</th></tr>
-          ${signalRows}
-        </table>
-      </div>
-
-    </body>
-    </html>
-  `);
-
-});
-
-app.post("/admin/remove", requireAdminAuth, (req, res) => {
-  const chatId = Number(req.body.chatId);
-  subscribers.delete(chatId);
-  res.redirect("/admin");
-});
-
-app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
-  const text = (req.body.message || "").trim();
-
-  if (text) {
-    for (const chatId of subscribers.keys()) {
-      bot.sendMessage(chatId, `📢 ${text}`).catch(err => {
-        console.error(`Broadcast failed for ${chatId}:`, err.message);
-      });
-    }
-  }
-
-  res.redirect("/admin");
-});
-
-
-// ===============================
-// GET LIVE XAUUSD PRICE
-// ===============================
+/* =========================================================
+   GOLD PRICE
+========================================================= */
 
 async function getGoldPrice() {
+  try {
+    const response = await axios.get(
+      "https://xaus.com/api/v1/spot?compact=1",
+      {
+        timeout: 10000
+      }
+    );
 
-  const response = await axios.get(
-    "https://xaus.com/api/v1/spot?compact=1",
-    {
-      timeout: 10000
+    const data = response.data;
+
+    if (!data || !data.xau || !data.xau.price) {
+      throw new Error("Invalid XAUUSD data");
     }
-  );
 
-  const data = response.data;
+    const price = Number(data.xau.price);
 
-  if (!data.xau || !data.xau.price) {
-    throw new Error("Invalid XAUUSD data");
+    if (!Number.isFinite(price)) {
+      throw new Error("Invalid XAUUSD price");
+    }
+
+    return price;
+  } catch (error) {
+    throw new Error(`XAUUSD price error: ${error.message}`);
   }
-
-  return Number(data.xau.price);
 }
 
-
-// ================================================================
-// CANDLE BUILDER
-// ================================================================
-// The free price API only returns the CURRENT spot price, not a
-// history of candles. So this bot builds its own candle history by
-// sampling the live price every 30 seconds and grouping those ticks
-// into 5-minute candles (10 ticks per candle).
-//
-// IMPORTANT: because history has to be built from scratch, the
-// signal engine needs a couple of hours of uptime before it has
-// enough candles to find real market structure. It will not (and
-// should not) fire signals the moment it starts up.
-// ================================================================
-
-const TICKS_PER_CANDLE = 10; // 10 x 30s = 5 minutes per candle
-const MAX_CANDLES = 300;     // keep roughly the last 25 hours
-
-let currentTicks = [];
-let candles = []; // { open, high, low, close, time }
+/* =========================================================
+   CANDLE BUILDER
+========================================================= */
 
 function addTick(price) {
   currentTicks.push(price);
@@ -308,658 +128,1507 @@ function addTick(price) {
   if (currentTicks.length >= TICKS_PER_CANDLE) {
     const open = currentTicks[0];
     const close = currentTicks[currentTicks.length - 1];
+
     const high = Math.max(...currentTicks);
     const low = Math.min(...currentTicks);
 
-    candles.push({ open, high, low, close, time: Date.now() });
-    if (candles.length > MAX_CANDLES) candles.shift();
+    const candle = {
+      open,
+      high,
+      low,
+      close,
+      time: Date.now()
+    };
+
+    candles.push(candle);
+
+    if (candles.length > MAX_CANDLES) {
+      candles.shift();
+    }
 
     currentTicks = [];
 
-    // A candle just closed - re-run the signal engine
     analyzeMarket();
   }
 }
 
+/* =========================================================
+   CANDLE HELPERS
+========================================================= */
 
-// ================================================================
-// SWING HIGH / LOW DETECTION (fractals)
-// ================================================================
-// A candle counts as a swing high if its high is greater than the
-// `lookback` candles immediately before AND after it. Same idea,
-// inverted, for swing lows. This is the standard way to find the
-// "structure points" that BOS/CHoCH are measured against.
-// ================================================================
-
-function findSwings(lookback = 2) {
-  const swings = [];
-
-  for (let i = lookback; i < candles.length - lookback; i++) {
-    const slice = candles.slice(i - lookback, i + lookback + 1);
-    const c = candles[i];
-
-    const isHigh = slice.every(s => s.high <= c.high);
-    const isLow = slice.every(s => s.low >= c.low);
-
-    if (isHigh) swings.push({ index: i, price: c.high, type: "high" });
-    if (isLow) swings.push({ index: i, price: c.low, type: "low" });
-  }
-
-  return swings;
+function isBullish(candle) {
+  return candle.close > candle.open;
 }
 
-
-// ================================================================
-// FAIR VALUE GAP (FVG) DETECTION
-// ================================================================
-// Bullish FVG: candle[i-2]'s high sits below candle[i]'s low - an
-// unfilled gap left behind by an impulsive move up.
-// Bearish FVG: candle[i-2]'s low sits above candle[i]'s high.
-// ================================================================
-
-function findFVG(startIndex, direction) {
-  for (let i = startIndex; i >= 2 && i >= startIndex - 5; i--) {
-    const c1 = candles[i - 2];
-    const c3 = candles[i];
-
-    if (direction === "bullish" && c1.high < c3.low) {
-      return { top: c3.low, bottom: c1.high, index: i };
-    }
-    if (direction === "bearish" && c1.low > c3.high) {
-      return { top: c1.low, bottom: c3.high, index: i };
-    }
-  }
-  return null;
+function isBearish(candle) {
+  return candle.close < candle.open;
 }
 
-
-// ================================================================
-// ORDER BLOCK DETECTION
-// ================================================================
-// The last opposite-colored candle right before the impulsive move
-// that broke structure - the classic ICT "order block" zone.
-// ================================================================
-
-function findOrderBlock(breakIndex, direction) {
-  for (let i = breakIndex; i >= 0 && i >= breakIndex - 6; i--) {
-    const c = candles[i];
-    const isBearishCandle = c.close < c.open;
-    const isBullishCandle = c.close > c.open;
-
-    if (direction === "bullish" && isBearishCandle) {
-      return { top: c.high, bottom: c.low, index: i };
-    }
-    if (direction === "bearish" && isBullishCandle) {
-      return { top: c.high, bottom: c.low, index: i };
-    }
-  }
-  return null;
+function bodySize(candle) {
+  return Math.abs(candle.close - candle.open);
 }
 
-
-// ================================================================
-// SIGNAL ENGINE STATE
-// ================================================================
-
-let pendingSetup = null; // { direction, label, fvg, orderBlock, breakLevel, createdAt }
-let lastSignalTime = 0;
-const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000; // rest period after a signal closes before hunting resumes
-const SETUP_EXPIRY_MS = 3 * 60 * 60 * 1000; // drop an unconfirmed setup after 3 hours
-
-const PIP_SIZE = 0.1; // XAUUSD convention used here: 1 "pip" = $0.10 move
-const TP_PIPS_MIN = 200;
-const TP_PIPS_MAX = 300;
-
-
-// ================================================================
-// MAIN ANALYSIS - runs every time a new 5-minute candle closes
-// ================================================================
-
-function hasOpenSignal() {
-  return signalHistory.some(s => s.status === "open");
+function candleRange(candle) {
+  return candle.high - candle.low;
 }
 
-function analyzeMarket() {
-  if (candles.length < 20) return; // not enough history yet
-
-  // Strict one-at-a-time rule: never hunt for a new setup while a
-  // previous signal is still running. Wait for it to hit TP or SL
-  // (checkOpenSignals handles that), send the result, THEN resume
-  // scanning. This keeps the bot from ever overlapping trades.
-  if (hasOpenSignal()) return;
-
-  const swings = findSwings(2);
-  if (swings.length < 4) return;
-
-  const swingHighs = swings.filter(s => s.type === "high");
-  const swingLows = swings.filter(s => s.type === "low");
-
-  const lastHigh = swingHighs[swingHighs.length - 1];
-  const prevHigh = swingHighs[swingHighs.length - 2];
-  const lastLow = swingLows[swingLows.length - 1];
-  const prevLow = swingLows[swingLows.length - 2];
-
-  if (!lastHigh || !prevHigh || !lastLow || !prevLow) return;
-
-  // Current structure/trend based on the last two swing points
-  const structureBullish = lastHigh.price > prevHigh.price && lastLow.price > prevLow.price;
-  const structureBearish = lastHigh.price < prevHigh.price && lastLow.price < prevLow.price;
-
-  const latestClose = candles[candles.length - 1].close;
-  const latestIndex = candles.length - 1;
-
-  const brokeAboveHigh = latestClose > lastHigh.price;
-  const brokeBelowLow = latestClose < lastLow.price;
-
-  // Bullish break: BOS if structure was already bullish, CHoCH if it
-  // was bearish (a break like this signals a possible reversal).
-  if (brokeAboveHigh && !pendingSetup) {
-    const fvg = findFVG(latestIndex, "bullish");
-    if (fvg) {
-      const ob = findOrderBlock(fvg.index, "bullish");
-      pendingSetup = {
-        direction: "bullish",
-        label: structureBullish ? "BOS" : "CHoCH",
-        fvg,
-        orderBlock: ob,
-        structureLow: lastLow.price,
-        createdAt: Date.now()
-      };
-      console.log(`[SETUP] Bullish ${pendingSetup.label} detected @ ${latestClose}`);
-    }
-  }
-
-  if (brokeBelowLow && !pendingSetup) {
-    const fvg = findFVG(latestIndex, "bearish");
-    if (fvg) {
-      const ob = findOrderBlock(fvg.index, "bearish");
-      pendingSetup = {
-        direction: "bearish",
-        label: structureBearish ? "BOS" : "CHoCH",
-        fvg,
-        orderBlock: ob,
-        structureHigh: lastHigh.price,
-        createdAt: Date.now()
-      };
-      console.log(`[SETUP] Bearish ${pendingSetup.label} detected @ ${latestClose}`);
-    }
-  }
-
-  // If a setup is pending, watch for price retracing back into the
-  // FVG / order block zone with a confirming candle before firing.
-  if (pendingSetup) {
-
-    if (Date.now() - pendingSetup.createdAt > SETUP_EXPIRY_MS) {
-      console.log("[SETUP] Expired without confirmation");
-      pendingSetup = null;
-      return;
-    }
-
-    const zoneTop = pendingSetup.orderBlock ? pendingSetup.orderBlock.top : pendingSetup.fvg.top;
-    const zoneBottom = pendingSetup.orderBlock ? pendingSetup.orderBlock.bottom : pendingSetup.fvg.bottom;
-
-    const priceInZone = latestClose <= zoneTop && latestClose >= zoneBottom;
-
-    if (priceInZone) {
-      const confirmCandle = candles[candles.length - 1];
-      const bullishConfirm = pendingSetup.direction === "bullish" && confirmCandle.close > confirmCandle.open;
-      const bearishConfirm = pendingSetup.direction === "bearish" && confirmCandle.close < confirmCandle.open;
-
-      if (bullishConfirm || bearishConfirm) {
-        fireSignal(pendingSetup, latestClose);
-        pendingSetup = null;
-      }
-    }
-  }
+function getRecentCandles(count = 20) {
+  return candles.slice(-count);
 }
 
+/* =========================================================
+   SWING DETECTION
+========================================================= */
 
-// ================================================================
-// FIRE SIGNAL - broadcast the confirmed entry to all subscribers
-// ================================================================
-
-function fireSignal(setup, entryPrice) {
-
-  if (Date.now() - lastSignalTime < SIGNAL_COOLDOWN_MS) {
-    console.log("[SIGNAL] Skipped - cooldown active");
-    return;
-  }
-  lastSignalTime = Date.now();
-
-  const direction = setup.direction === "bullish" ? "BUY" : "SELL";
-  const emoji = setup.direction === "bullish" ? "🟢" : "🔴";
-
-  const tpDistance = ((TP_PIPS_MIN + TP_PIPS_MAX) / 2) * PIP_SIZE; // midpoint of 200-300 pip range
-
-  let stopLoss, takeProfit;
-
-  if (setup.direction === "bullish") {
-    stopLoss = (setup.orderBlock ? setup.orderBlock.bottom : setup.structureLow) - 1;
-    takeProfit = entryPrice + tpDistance;
-  } else {
-    stopLoss = (setup.orderBlock ? setup.orderBlock.top : setup.structureHigh) + 1;
-    takeProfit = entryPrice - tpDistance;
+function findSwingHigh(index, strength = 2) {
+  if (
+    index < strength ||
+    index >= candles.length - strength
+  ) {
+    return false;
   }
 
-  const message =
-`🚨 XAUUSD SIGNAL - ${setup.label}
+  const candle = candles[index];
 
-${emoji} ${direction} @ ${entryPrice.toFixed(2)}
-
-🛡️ Stop Loss: ${stopLoss.toFixed(2)}
-🎯 Take Profit: ${takeProfit.toFixed(2)}
-📏 Target: ~${TP_PIPS_MIN}-${TP_PIPS_MAX} pips
-
-📊 Confirmed by:
-• Market Structure (${setup.label})
-• Fair Value Gap
-• Order Block retest + confirmation candle
-
-⚠️ Always manage your own risk. This is not financial advice.`;
-
-  console.log(`[SIGNAL FIRED] ${direction} @ ${entryPrice}`);
-
-  signalHistory.unshift({
-    id: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-    time: Date.now(),
-    label: setup.label,
-    direction,
-    entryPrice,
-    stopLoss,
-    takeProfit,
-    status: "open",      // open -> win / loss once price hits TP or SL
-    closedAt: null,
-    closePrice: null
-  });
-  if (signalHistory.length > MAX_SIGNAL_HISTORY) signalHistory.pop();
-
-  for (const chatId of subscribers.keys()) {
-    bot.sendMessage(chatId, message).catch(err => {
-      console.error(`Failed to send signal to ${chatId}:`, err.message);
-    });
+  for (let i = 1; i <= strength; i++) {
+    if (
+      candle.high <= candles[index - i].high ||
+      candle.high <= candles[index + i].high
+    ) {
+      return false;
+    }
   }
+
+  return true;
 }
 
+function findSwingLow(index, strength = 2) {
+  if (
+    index < strength ||
+    index >= candles.length - strength
+  ) {
+    return false;
+  }
 
-// ================================================================
-// OUTCOME TRACKER
-// ================================================================
-// Runs on every price tick (every 30 seconds). Checks every still-
-// open signal against the current live price - if price has hit
-// either the Take Profit or Stop Loss, the signal is marked as a
-// win or a loss and everyone subscribed gets notified.
-// ================================================================
+  const candle = candles[index];
 
-function checkOpenSignals(currentPrice) {
+  for (let i = 1; i <= strength; i++) {
+    if (
+      candle.low >= candles[index - i].low ||
+      candle.low >= candles[index + i].low
+    ) {
+      return false;
+    }
+  }
 
-  const openSignals = signalHistory.filter(s => s.status === "open");
+  return true;
+}
 
-  for (const signal of openSignals) {
+/* =========================================================
+   MARKET STRUCTURE
+========================================================= */
 
-    let hitTP = false;
-    let hitSL = false;
+function getStructure() {
+  if (candles.length < 15) {
+    return null;
+  }
 
-    if (signal.direction === "BUY") {
-      hitTP = currentPrice >= signal.takeProfit;
-      hitSL = currentPrice <= signal.stopLoss;
-    } else {
-      hitTP = currentPrice <= signal.takeProfit;
-      hitSL = currentPrice >= signal.stopLoss;
+  const highs = [];
+  const lows = [];
+
+  const start = Math.max(2, candles.length - 40);
+  const end = candles.length - 2;
+
+  for (let i = start; i <= end; i++) {
+    if (findSwingHigh(i, 2)) {
+      highs.push({
+        price: candles[i].high,
+        index: i,
+        time: candles[i].time
+      });
     }
 
-    // If both somehow trip on the same tick (fast spike/wick), treat
-    // the Stop Loss as hit first - the more conservative outcome.
-    if (hitSL) {
-      signal.status = "loss";
-    } else if (hitTP) {
-      signal.status = "win";
-    } else {
-      continue; // still open, nothing to do
-    }
-
-    signal.closedAt = Date.now();
-    signal.closePrice = currentPrice;
-
-    // Cooldown now counts from when THIS signal closed, not when it
-    // opened - guarantees a clean rest period after every result
-    // before the bot starts hunting for the next setup.
-    lastSignalTime = Date.now();
-
-    const resultEmoji = signal.status === "win" ? "✅" : "❌";
-    const resultText = signal.status === "win" ? "TAKE PROFIT HIT" : "STOP LOSS HIT";
-
-    const closeMessage =
-`${resultEmoji} SIGNAL CLOSED - ${resultText}
-
-${signal.direction} @ ${signal.entryPrice.toFixed(2)}
-Closed @ ${currentPrice.toFixed(2)}
-
-${signal.status === "win" ? "🎯 Target reached." : "🛡️ Stop loss protected your downside."}`;
-
-    console.log(`[SIGNAL CLOSED] ${signal.direction} @ ${signal.entryPrice} -> ${signal.status.toUpperCase()} @ ${currentPrice}`);
-
-    for (const chatId of subscribers.keys()) {
-      bot.sendMessage(chatId, closeMessage).catch(err => {
-        console.error(`Failed to send close update to ${chatId}:`, err.message);
+    if (findSwingLow(i, 2)) {
+      lows.push({
+        price: candles[i].low,
+        index: i,
+        time: candles[i].time
       });
     }
   }
+
+  if (highs.length < 2 || lows.length < 2) {
+    return null;
+  }
+
+  const previousHigh = highs[highs.length - 2];
+  const latestHigh = highs[highs.length - 1];
+
+  const previousLow = lows[lows.length - 2];
+  const latestLow = lows[lows.length - 1];
+
+  let trend = "RANGE";
+
+  if (
+    latestHigh.price > previousHigh.price &&
+    latestLow.price > previousLow.price
+  ) {
+    trend = "BULLISH";
+  }
+
+  if (
+    latestHigh.price < previousHigh.price &&
+    latestLow.price < previousLow.price
+  ) {
+    trend = "BEARISH";
+  }
+
+  return {
+    trend,
+    previousHigh,
+    latestHigh,
+    previousLow,
+    latestLow
+  };
 }
 
+/* =========================================================
+   LIQUIDITY
+========================================================= */
 
-// ===============================
-// START COMMAND
-// ===============================
+function detectLiquidity() {
+  if (candles.length < 10) {
+    return null;
+  }
 
-bot.onText(/\/start/, (msg) => {
+  const recent = getRecentCandles(10);
 
-  bot.sendMessage(
-    msg.chat.id,
+  const high = Math.max(...recent.map(c => c.high));
+  const low = Math.min(...recent.map(c => c.low));
 
-`🔥 MONEY MAKING MACHINE BOT
+  const last = candles[candles.length - 1];
+
+  if (last.high >= high) {
+    return {
+      type: "BUY_SIDE_LIQUIDITY",
+      price: high
+    };
+  }
+
+  if (last.low <= low) {
+    return {
+      type: "SELL_SIDE_LIQUIDITY",
+      price: low
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   FVG DETECTION
+========================================================= */
+
+function detectFVG() {
+  if (candles.length < 3) {
+    return null;
+  }
+
+  const a = candles[candles.length - 3];
+  const b = candles[candles.length - 2];
+  const c = candles[candles.length - 1];
+
+  // Bullish FVG
+  if (c.low > a.high) {
+    return {
+      type: "BULLISH",
+      low: a.high,
+      high: c.low,
+      middle: b
+    };
+  }
+
+  // Bearish FVG
+  if (c.high < a.low) {
+    return {
+      type: "BEARISH",
+      low: c.high,
+      high: a.low,
+      middle: b
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   ORDER BLOCK
+========================================================= */
+
+function detectOrderBlock(direction) {
+  if (candles.length < 5) {
+    return null;
+  }
+
+  for (let i = candles.length - 2; i >= Math.max(0, candles.length - 10); i--) {
+    const candle = candles[i];
+
+    if (direction === "BUY" && isBearish(candle)) {
+      return {
+        type: "BULLISH_ORDER_BLOCK",
+        high: candle.high,
+        low: candle.low,
+        index: i
+      };
+    }
+
+    if (direction === "SELL" && isBullish(candle)) {
+      return {
+        type: "BEARISH_ORDER_BLOCK",
+        high: candle.high,
+        low: candle.low,
+        index: i
+      };
+    }
+  }
+
+  return null;
+}
+
+/* =========================================================
+   BREAK OF STRUCTURE
+========================================================= */
+
+function detectStructureBreak(structure) {
+  if (!structure || candles.length < 2) {
+    return null;
+  }
+
+  const last = candles[candles.length - 1];
+
+  if (
+    last.close > structure.latestHigh.price
+  ) {
+    return {
+      type: "BOS",
+      direction: "BUY",
+      price: last.close
+    };
+  }
+
+  if (
+    last.close < structure.latestLow.price
+  ) {
+    return {
+      type: "BOS",
+      direction: "SELL",
+      price: last.close
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   CHOCH DETECTION
+========================================================= */
+
+function detectCHoCH(structure) {
+  if (!structure || candles.length < 2) {
+    return null;
+  }
+
+  const last = candles[candles.length - 1];
+
+  if (
+    structure.trend === "BEARISH" &&
+    last.close > structure.latestHigh.price
+  ) {
+    return {
+      type: "CHoCH",
+      direction: "BUY",
+      price: last.close
+    };
+  }
+
+  if (
+    structure.trend === "BULLISH" &&
+    last.close < structure.latestLow.price
+  ) {
+    return {
+      type: "CHoCH",
+      direction: "SELL",
+      price: last.close
+    };
+  }
+
+  return null;
+}
+
+/* =========================================================
+   CONFIRMATION CANDLE
+========================================================= */
+
+function confirmationCandle(direction) {
+  if (candles.length < 2) {
+    return false;
+  }
+
+  const candle = candles[candles.length - 1];
+
+  const range = candleRange(candle);
+
+  if (range <= 0) {
+    return false;
+  }
+
+  const body = bodySize(candle);
+
+  // Require meaningful candle body
+  if (body / range < 0.45) {
+    return false;
+  }
+
+  if (direction === "BUY" && isBullish(candle)) {
+    return true;
+  }
+
+  if (direction === "SELL" && isBearish(candle)) {
+    return true;
+  }
+
+  return false;
+}
+
+/* =========================================================
+   RETEST CHECK
+========================================================= */
+
+function priceInsideZone(price, low, high) {
+  return price >= low && price <= high;
+}
+
+function retestConfirmed(direction, orderBlock, fvg) {
+  if (!orderBlock && !fvg) {
+    return false;
+  }
+
+  const price = candles[candles.length - 1].close;
+
+  if (orderBlock) {
+    if (
+      priceInsideZone(
+        price,
+        orderBlock.low,
+        orderBlock.high
+      )
+    ) {
+      return true;
+    }
+  }
+
+  if (fvg) {
+    if (
+      priceInsideZone(
+        price,
+        fvg.low,
+        fvg.high
+      )
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/* =========================================================
+   STOP LOSS / TAKE PROFIT
+========================================================= */
+
+function calculateTargets(direction, entry) {
+  const tpPips =
+    TP_PIPS_MIN +
+    Math.floor(
+      Math.random() *
+      (TP_PIPS_MAX - TP_PIPS_MIN + 1)
+    );
+
+  const tpDistance = tpPips * PIP_SIZE;
+
+  const stopDistance = Math.max(
+    80 * PIP_SIZE,
+    tpDistance * 0.5
+  );
+
+  let stopLoss;
+  let takeProfit;
+
+  if (direction === "BUY") {
+    stopLoss = entry - stopDistance;
+    takeProfit = entry + tpDistance;
+  } else {
+    stopLoss = entry + stopDistance;
+    takeProfit = entry - tpDistance;
+  }
+
+  return {
+    stopLoss: Number(stopLoss.toFixed(2)),
+    takeProfit: Number(takeProfit.toFixed(2)),
+    tpPips
+  };
+}
+
+/* =========================================================
+   ANALYZE MARKET
+========================================================= */
+
+function analyzeMarket() {
+  if (candles.length < 20) {
+    return;
+  }
+
+  // Don't create another setup while one is waiting
+  if (pendingSetup) {
+    if (
+      Date.now() - pendingSetup.createdAt >
+      SETUP_EXPIRY_MS
+    ) {
+      console.log("⌛ Pending setup expired");
+      pendingSetup = null;
+    } else {
+      checkPendingSetup();
+      return;
+    }
+  }
+
+  // Prevent signals too close together
+  if (
+    Date.now() - lastSignalTime <
+    SIGNAL_COOLDOWN_MS
+  ) {
+    return;
+  }
+
+  const structure = getStructure();
+
+  if (!structure) {
+    return;
+  }
+
+  const bos = detectStructureBreak(structure);
+  const choch = detectCHoCH(structure);
+
+  const structureBreak = choch || bos;
+
+  if (!structureBreak) {
+    return;
+  }
+
+  const direction = structureBreak.direction;
+
+  const liquidity = detectLiquidity();
+
+  const fvg = detectFVG();
+
+  const orderBlock =
+    detectOrderBlock(direction);
+
+  if (!fvg && !orderBlock) {
+    return;
+  }
+
+  const setup = {
+    direction,
+    structure:
+      structureBreak.type,
+    structurePrice:
+      structureBreak.price,
+    liquidity,
+    fvg,
+    orderBlock,
+    createdAt: Date.now()
+  };
+
+  pendingSetup = setup;
+
+  console.log(
+    `🧠 SETUP DETECTED: ${direction} ${structureBreak.type}`
+  );
+
+  checkPendingSetup();
+}
+
+/* =========================================================
+   CHECK PENDING SETUP
+========================================================= */
+
+function checkPendingSetup() {
+  if (!pendingSetup) {
+    return;
+  }
+
+  const direction =
+    pendingSetup.direction;
+
+  const last =
+    candles[candles.length - 1];
+
+  if (!last) {
+    return;
+  }
+
+  const price = last.close;
+
+  let retest = false;
+
+  if (pendingSetup.orderBlock) {
+    retest = priceInsideZone(
+      price,
+      pendingSetup.orderBlock.low,
+      pendingSetup.orderBlock.high
+    );
+  }
+
+  if (
+    !retest &&
+    pendingSetup.fvg
+  ) {
+    retest = priceInsideZone(
+      price,
+      pendingSetup.fvg.low,
+      pendingSetup.fvg.high
+    );
+  }
+
+  if (!retest) {
+    return;
+  }
+
+  if (
+    !confirmationCandle(direction)
+  ) {
+    return;
+  }
+
+  fireSignal(
+    direction,
+    pendingSetup
+  );
+
+  pendingSetup = null;
+}
+
+/* =========================================================
+   SIGNAL CREATION
+========================================================= */
+
+function fireSignal(
+  direction,
+  setup
+) {
+  const entry =
+    candles[candles.length - 1].close;
+
+  const targets =
+    calculateTargets(
+      direction,
+      entry
+    );
+
+  const signal = {
+    id:
+      `XAU-${Date.now()}`,
+
+    symbol: SYMBOL,
+
+    direction,
+
+    entryPrice:
+      Number(entry.toFixed(2)),
+
+    stopLoss:
+      targets.stopLoss,
+
+    takeProfit:
+      targets.takeProfit,
+
+    targetPips:
+      targets.tpPips,
+
+    structure:
+      setup.structure,
+
+    liquidity:
+      setup.liquidity
+        ? setup.liquidity.type
+        : "Confirmed",
+
+    fvg:
+      setup.fvg
+        ? setup.fvg.type
+        : "Confirmed",
+
+    orderBlock:
+      setup.orderBlock
+        ? setup.orderBlock.type
+        : "Confirmed",
+
+    status: "OPEN",
+
+    createdAt: Date.now(),
+
+    closedAt: null
+  };
+
+  signalHistory.unshift(signal);
+
+  if (
+    signalHistory.length >
+    MAX_SIGNAL_HISTORY
+  ) {
+    signalHistory.pop();
+  }
+
+  lastSignalTime = Date.now();
+
+  console.log(
+    `🚨 NEW ${direction} SIGNAL @ ${entry}`
+  );
+
+  broadcastSignal(signal);
+}
+
+/* =========================================================
+   SIGNAL MESSAGE
+========================================================= */
+
+function buildSignalMessage(signal) {
+  const emoji =
+    signal.direction === "BUY"
+      ? "🟢 BUY"
+      : "🔴 SELL";
+
+  return `
+🚨 ${SYMBOL} SIGNAL
+
+${emoji}
+
+💰 Entry: ${formatPrice(signal.entryPrice)}
+
+🛡️ Stop Loss:
+${formatPrice(signal.stopLoss)}
+
+🎯 Take Profit:
+${formatPrice(signal.takeProfit)}
+
+📏 Target:
+~${signal.targetPips} pips
+
+📊 Confirmed By:
+• Market Structure (${signal.structure})
+• Liquidity
+• Fair Value Gap
+• Order Block
+• Retest
+• Confirmation Candle
+
+🆔 Signal:
+${signal.id}
+
+⚠️ Manage your own risk.
+`;
+}
+
+/* =========================================================
+   BROADCAST SIGNAL
+========================================================= */
+
+async function broadcastSignal(signal) {
+  const message =
+    buildSignalMessage(signal);
+
+  for (
+    const chatId of subscribers.keys()
+  ) {
+    try {
+      await bot.sendMessage(
+        chatId,
+        message,
+        mainMenu
+      );
+    } catch (error) {
+      console.error(
+        `Telegram signal error for ${chatId}:`,
+        error.message
+      );
+    }
+  }
+}
+
+/* =========================================================
+   CHECK OPEN SIGNALS
+========================================================= */
+
+async function checkOpenSignals(
+  currentPrice
+) {
+  const openSignals =
+    signalHistory.filter(
+      signal =>
+        signal.status === "OPEN"
+    );
+
+  for (
+    const signal of openSignals
+  ) {
+    let result = null;
+
+    if (
+      signal.direction === "BUY"
+    ) {
+      if (
+        currentPrice <=
+        signal.stopLoss
+      ) {
+        result = "LOSS";
+      } else if (
+        currentPrice >=
+        signal.takeProfit
+      ) {
+        result = "WIN";
+      }
+    }
+
+    if (
+      signal.direction === "SELL"
+    ) {
+      if (
+        currentPrice >=
+        signal.stopLoss
+      ) {
+        result = "LOSS";
+      } else if (
+        currentPrice <=
+        signal.takeProfit
+      ) {
+        result = "WIN";
+      }
+    }
+
+    if (!result) {
+      continue;
+    }
+
+    signal.status = result;
+    signal.closedAt = Date.now();
+    signal.closePrice =
+      Number(currentPrice.toFixed(2));
+
+    await broadcastResult(
+      signal
+    );
+  }
+}
+
+/* =========================================================
+   RESULT MESSAGE
+========================================================= */
+
+async function broadcastResult(
+  signal
+) {
+  let message;
+
+  if (
+    signal.status === "WIN"
+  ) {
+    message = `
+🏆 XAUUSD SIGNAL RESULT
+
+🟢 ${signal.direction}
+
+✅ RESULT: WIN
+
+💰 Entry:
+${formatPrice(signal.entryPrice)}
+
+🎯 Target:
+${formatPrice(signal.takeProfit)}
+
+📍 Closed:
+${formatPrice(signal.closePrice)}
+
+📏 Target:
+~${signal.targetPips} pips
+
+🆔 ${signal.id}
+`;
+  } else {
+    message = `
+🔴 XAUUSD SIGNAL RESULT
+
+${signal.direction === "BUY"
+      ? "🟢 BUY"
+      : "🔴 SELL"}
+
+❌ RESULT: LOSS
+
+💰 Entry:
+${formatPrice(signal.entryPrice)}
+
+🛡️ Stop Loss:
+${formatPrice(signal.stopLoss)}
+
+📍 Closed:
+${formatPrice(signal.closePrice)}
+
+🆔 ${signal.id}
+`;
+  }
+
+  for (
+    const chatId of subscribers.keys()
+  ) {
+    try {
+      await bot.sendMessage(
+        chatId,
+        message,
+        mainMenu
+      );
+    } catch (error) {
+      console.error(
+        `Telegram result error for ${chatId}:`,
+        error.message
+      );
+    }
+  }
+}
+
+/* =========================================================
+   START COMMAND
+   AUTOMATICALLY SUBSCRIBES USER
+========================================================= */
+
+bot.onText(
+  /\/start/,
+  async msg => {
+    const existing =
+      subscribers.get(
+        msg.chat.id
+      );
+
+    subscribers.set(
+      msg.chat.id,
+      {
+        username:
+          msg.from.username || null,
+
+        firstName:
+          msg.from.first_name ||
+          "Unknown",
+
+        joinedAt:
+          existing
+            ? existing.joinedAt
+            : Date.now()
+      }
+    );
+
+    try {
+      await bot.sendMessage(
+        msg.chat.id,
+`
+🔥 ${BOT_NAME}
 
 Welcome! 👋
 
-Your XAUUSD trading assistant.
+Your XAUUSD trading assistant is now ACTIVE.
 
-📊 Market analysis
-🚨 Entry alerts
-🎯 200–300 pip targets
-🛡️ Risk levels
+🤖 Automatic Monitoring: ON
+🚨 Automatic Signals: ON
 
-Choose an option below:`,
-    mainMenu
-  );
+The bot will continuously monitor XAUUSD and automatically send a signal when all required conditions are confirmed.
 
-});
-
-
-// ===============================
-// 📊 XAUUSD SIGNAL BUTTON
-// ===============================
-
-bot.on("message", async (msg) => {
-
-  if (!msg.text) return;
-
-  if (msg.text === "📊 XAUUSD Signal") {
-
-    try {
-
-      const price = await getGoldPrice();
-      const status = pendingSetup
-        ? `👀 Watching a ${pendingSetup.label} ${pendingSetup.direction.toUpperCase()} setup - waiting for retest confirmation.`
-        : candles.length < 20
-          ? `⏳ Still building candle history (${candles.length}/20 candles). Give the bot a bit more uptime.`
-          : `🔎 No active setup right now - scanning every 5 minutes.`;
-
-      await bot.sendMessage(
-        msg.chat.id,
-
-`🔎 XAUUSD MARKET CHECK
-
-💰 Current Price: ${price.toFixed(2)}
-
-📡 Live market data connected.
-
-${status}
-
-📊 Checking:
-• Market Structure
-• BOS / CHoCH
-• Liquidity
-• FVG
-• Order Block
-
-🚨 A signal will be sent automatically when the entry conditions are confirmed.`
-      );
-
-    } catch (error) {
-
-      console.error("Signal price error:", error.message);
-
-      bot.sendMessage(
-        msg.chat.id,
-        "⚠️ XAUUSD market data is temporarily unavailable."
-      );
-
-    }
-
-  }
-
-
-  // ===============================
-  // 💰 LIVE PRICE
-  // ===============================
-
-  if (msg.text === "💰 Live Price") {
-
-    try {
-
-      const price = await getGoldPrice();
-
-      bot.sendMessage(
-        msg.chat.id,
-
-`💰 XAUUSD LIVE PRICE
-
-🪙 ${price.toFixed(2)}
-
-📡 Market Data: LIVE
-⏱️ Updated: Just now`
-      );
-
-    } catch (error) {
-
-      console.error("Price error:", error.message);
-
-      bot.sendMessage(
-        msg.chat.id,
-        "⚠️ Unable to retrieve the current XAUUSD price."
-      );
-
-    }
-
-  }
-
-
-  // ===============================
-  // 🔔 AUTO SIGNALS
-  // ===============================
-
-  if (msg.text === "🔔 Auto Signals") {
-
-    subscribers.set(msg.chat.id, {
-      username: msg.from.username || null,
-      firstName: msg.from.first_name || "Unknown",
-      joinedAt: subscribers.has(msg.chat.id) ? subscribers.get(msg.chat.id).joinedAt : Date.now()
-    });
-
-    bot.sendMessage(
-      msg.chat.id,
-
-`🔔 AUTOMATIC SIGNALS ENABLED
-
-MONEY MAKING MACHINE BOT will monitor XAUUSD automatically.
-
-You will receive an alert when a complete trading setup is confirmed.
-
-📊 BOS / CHoCH
+📊 Market Structure
 💧 Liquidity
-🟨 FVG
+🟨 Fair Value Gap
 🟦 Order Block
-✅ Entry confirmation
+🔄 Retest
+✅ Confirmation Candle
 🎯 200–300 pip target
 
-You don't need to keep typing /signal.
+You do NOT need to activate anything manually.
 
-Note: the bot builds its own candle history from live prices, so the first real setups may take a couple of hours to appear after each restart.`
-    );
-
+Use 🔕 Stop Alerts anytime to stop automatic signals.
+`,
+        mainMenu
+      );
+    } catch (error) {
+      console.error(
+        "Start message error:",
+        error.message
+      );
+    }
   }
+);
 
+/* =========================================================
+   TELEGRAM MESSAGE HANDLER
+========================================================= */
 
-  // ===============================
-  // 🔕 STOP SIGNALS
-  // ===============================
+bot.on(
+  "message",
+  async msg => {
+    if (!msg.text) {
+      return;
+    }
 
-  if (msg.text === "🔕 Stop Alerts") {
+    if (
+      msg.text.startsWith("/")
+    ) {
+      return;
+    }
 
-    subscribers.delete(msg.chat.id);
+    const chatId =
+      msg.chat.id;
 
-    bot.sendMessage(
-      msg.chat.id,
+    /* -----------------------------------------
+       XAUUSD SIGNAL
+    ----------------------------------------- */
 
-`🔕 AUTOMATIC SIGNALS STOPPED
+    if (
+      msg.text ===
+      "📊 XAUUSD Signal"
+    ) {
+      try {
+        const price =
+          await getGoldPrice();
 
-You will no longer receive automatic XAUUSD entry alerts.
+        const active =
+          subscribers.has(chatId);
 
-You can turn them back on anytime with:
+        await bot.sendMessage(
+          chatId,
+`
+📊 XAUUSD STATUS
 
-🔔 Auto Signals`
-    );
+💰 Current Price:
+${formatPrice(price)}
 
-  }
+🤖 Automatic Monitoring:
+${active ? "🟢 ACTIVE" : "🔴 STOPPED"}
 
+🚨 Automatic Signals:
+${active ? "🟢 ON" : "🔴 OFF"}
 
-  // ===============================
-  // 📖 HOW IT WORKS
-  // ===============================
+The bot is waiting for a fully confirmed setup.
+`,
+          mainMenu
+        );
+      } catch (error) {
+        await bot.sendMessage(
+          chatId,
+          "⚠️ XAUUSD market data is temporarily unavailable.",
+          mainMenu
+        );
+      }
 
-  if (msg.text === "📖 How It Works") {
+      return;
+    }
 
-    bot.sendMessage(
-      msg.chat.id,
+    /* -----------------------------------------
+       LIVE PRICE
+    ----------------------------------------- */
 
-`📖 HOW IT WORKS
+    if (
+      msg.text ===
+      "💰 Live Price"
+    ) {
+      try {
+        const price =
+          await getGoldPrice();
 
-MONEY MAKING MACHINE BOT monitors XAUUSD for high-quality setups.
+        await bot.sendMessage(
+          chatId,
+`
+💰 XAUUSD LIVE PRICE
 
-The signal engine checks:
+${formatPrice(price)}
 
-📈 Market Structure
-BOS / CHoCH
+🟢 Market data connected
+`,
+          mainMenu
+        );
+      } catch (error) {
+        await bot.sendMessage(
+          chatId,
+          "⚠️ Unable to retrieve XAUUSD price right now.",
+          mainMenu
+        );
+      }
 
-💧 Liquidity
-Swing highs/lows used as structure points
+      return;
+    }
 
-🟨 Fair Value Gap
-FVG confirmation
+    /* -----------------------------------------
+       STOP ALERTS
+    ----------------------------------------- */
 
-🟦 Order Block
-Potential institutional zone
+    if (
+      msg.text ===
+      "🔕 Stop Alerts"
+    ) {
+      subscribers.delete(
+        chatId
+      );
 
-✅ Entry Confirmation
-Price must retest the FVG/order block zone with a confirming candle
+      await bot.sendMessage(
+        chatId,
+`
+🔕 AUTOMATIC SIGNALS STOPPED
 
-🎯 Target
-200–300 pip target range
+You will no longer receive automatic XAUUSD signals.
 
-🛡️ Risk
-Stop Loss is calculated from the order block / structure point
+To activate automatic signals again, simply send:
 
-🚨 When all required conditions are confirmed, the bot automatically sends an entry alert to everyone with Auto Signals on.
+/start
+`
+      );
 
-⏳ The bot builds its price history live, so it needs some uptime after each restart before it has enough candles to analyze.`
-    );
+      return;
+    }
 
-  }
+    /* -----------------------------------------
+       HOW IT WORKS
+    ----------------------------------------- */
 
+    if (
+      msg.text ===
+      "📖 How It Works"
+    ) {
+      await bot.sendMessage(
+        chatId,
+`
+📖 HOW IT WORKS
 
-  // ===============================
-  // ⚙️ SETTINGS
-  // ===============================
+The bot continuously monitors XAUUSD.
 
-  if (msg.text === "⚙️ Settings") {
+A signal is only generated after checking:
 
-    bot.sendMessage(
-      msg.chat.id,
+1️⃣ Market Structure
+2️⃣ BOS / CHoCH
+3️⃣ Liquidity
+4️⃣ Fair Value Gap
+5️⃣ Order Block
+6️⃣ Retest
+7️⃣ Confirmation Candle
 
-`⚙️ SETTINGS
+After confirmation:
 
-📊 Market
+🚨 BUY or SELL signal
+💰 Entry price
+🛡️ Stop Loss
+🎯 Take Profit
+📏 200–300 pip target
+
+After the trade reaches TP or SL, the bot automatically sends:
+
+🏆 WIN
+
+or
+
+🔴 LOSS
+`,
+        mainMenu
+      );
+
+      return;
+    }
+
+    /* -----------------------------------------
+       SETTINGS
+    ----------------------------------------- */
+
+    if (
+      msg.text ===
+      "⚙️ Settings"
+    ) {
+      await bot.sendMessage(
+        chatId,
+`
+⚙️ SETTINGS
+
+📊 Pair:
 XAUUSD
 
-🎯 Target
+🤖 Automatic Monitoring:
+ON
+
+🚨 Automatic Signals:
+${subscribers.has(chatId)
+          ? "ON"
+          : "OFF"}
+
+🎯 Target:
 200–300 pips
 
-🔔 Automatic Alerts
-Available
+📡 Signal Engine:
+Market Structure
+BOS / CHoCH
+Liquidity
+FVG
+Order Block
+Retest
+Confirmation
+`,
+        mainMenu
+      );
 
-⏱️ Market Monitoring
-Automatic (5-minute candles built from live price)
-
-📈 Signal Type
-Technical confirmation (BOS/CHoCH + FVG + Order Block)
-
-📉 Candles collected
-${candles.length}
-
-More settings will be added as the system develops.`
-    );
-
+      return;
+    }
   }
+);
 
-});
+/* =========================================================
+   ADMIN DASHBOARD
+========================================================= */
 
+app.get(
+  "/admin",
+  (req, res) => {
+    const auth =
+      req.headers.authorization;
 
-// ===============================
-// AUTOMATIC MARKET MONITOR
-// Runs every 30 seconds: fetches the live price and feeds it into
-// the candle builder, which in turn triggers the signal engine
-// whenever a new 5-minute candle closes.
-// ===============================
+    if (!auth) {
+      res.setHeader(
+        "WWW-Authenticate",
+        'Basic realm="Admin"'
+      );
+
+      return res
+        .status(401)
+        .send("Authentication required");
+    }
+
+    const encoded =
+      auth.split(" ")[1] || "";
+
+    let decoded = "";
+
+    try {
+      decoded =
+        Buffer.from(
+          encoded,
+          "base64"
+        ).toString("utf8");
+    } catch {
+      return res
+        .status(401)
+        .send("Invalid authentication");
+    }
+
+    const separator =
+      decoded.indexOf(":");
+
+    const username =
+      decoded.slice(
+        0,
+        separator
+      );
+
+    const password =
+      decoded.slice(
+        separator + 1
+      );
+
+    if (
+      username !== ADMIN_USER ||
+      password !== ADMIN_PASSWORD
+    ) {
+      return res
+        .status(401)
+        .send("Invalid credentials");
+    }
+
+    const totalSignals =
+      signalHistory.length;
+
+    const wins =
+      signalHistory.filter(
+        s => s.status === "WIN"
+      ).length;
+
+    const losses =
+      signalHistory.filter(
+        s => s.status === "LOSS"
+      ).length;
+
+    const closed =
+      wins + losses;
+
+    const winRate =
+      closed > 0
+        ? ((wins / closed) * 100).toFixed(1)
+        : "0.0";
+
+    const openSignals =
+      signalHistory.filter(
+        s => s.status === "OPEN"
+      ).length;
+
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>${BOT_NAME} Admin</title>
+
+<style>
+body{
+  font-family:Arial,sans-serif;
+  background:#07111f;
+  color:#fff;
+  padding:20px;
+}
+
+h1{
+  margin-bottom:25px;
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:
+  repeat(auto-fit,minmax(180px,1fr));
+  gap:15px;
+}
+
+.card{
+  background:#111d2e;
+  border-radius:14px;
+  padding:20px;
+}
+
+.value{
+  font-size:30px;
+  font-weight:bold;
+  margin-top:10px;
+}
+
+.green{
+  color:#20d47b;
+}
+
+.red{
+  color:#ff4d5a;
+}
+
+table{
+  width:100%;
+  margin-top:25px;
+  border-collapse:collapse;
+  background:#111d2e;
+}
+
+th,td{
+  padding:12px;
+  border-bottom:1px solid #26364c;
+  text-align:left;
+}
+
+</style>
+</head>
+
+<body>
+
+<h1>🔥 ${BOT_NAME}</h1>
+
+<div class="grid">
+
+<div class="card">
+Subscribers
+<div class="value">
+${subscribers.size}
+</div>
+</div>
+
+<div class="card">
+Total Signals
+<div class="value">
+${totalSignals}
+</div>
+</div>
+
+<div class="card">
+Open Signals
+<div class="value">
+${openSignals}
+</div>
+</div>
+
+<div class="card">
+Wins
+<div class="value green">
+${wins}
+</div>
+</div>
+
+<div class="card">
+Losses
+<div class="value red">
+${losses}
+</div>
+</div>
+
+<div class="card">
+Win Rate
+<div class="value">
+${winRate}%
+</div>
+</div>
+
+</div>
+
+<h2>Recent Signals</h2>
+
+<table>
+
+<tr>
+<th>Symbol</th>
+<th>Direction</th>
+<th>Entry</th>
+<th>SL</th>
+<th>TP</th>
+<th>Status</th>
+</tr>
+
+${signalHistory
+  .slice(0, 30)
+  .map(
+    signal => `
+<tr>
+<td>${signal.symbol}</td>
+<td>${signal.direction}</td>
+<td>${formatPrice(signal.entryPrice)}</td>
+<td>${formatPrice(signal.stopLoss)}</td>
+<td>${formatPrice(signal.takeProfit)}</td>
+<td>${signal.status}</td>
+</tr>
+`
+  )
+  .join("")}
+
+</table>
+
+</body>
+</html>
+`);
+  }
+);
+
+/* =========================================================
+   HEALTH CHECK
+========================================================= */
+
+app.get(
+  "/",
+  (req, res) => {
+    res.json({
+      status: "online",
+      bot: BOT_NAME,
+      symbol: SYMBOL,
+      automaticSignals: true,
+      subscribers:
+        subscribers.size,
+      candles:
+        candles.length,
+      pendingSetup:
+        !!pendingSetup,
+      uptime:
+        Math.floor(
+          (Date.now() -
+            botStartedAt) /
+            1000
+        )
+    });
+  }
+);
+
+/* =========================================================
+   MARKET MONITOR
+========================================================= */
 
 async function monitorMarket() {
-
   try {
-
-    const price = await getGoldPrice();
+    const price =
+      await getGoldPrice();
 
     console.log(
-      `[MARKET] XAUUSD: ${price.toFixed(2)} | ticks: ${currentTicks.length + 1}/${TICKS_PER_CANDLE} | candles: ${candles.length}`
+      `[MARKET] ${SYMBOL}: ${price.toFixed(2)} | ticks: ${currentTicks.length + 1}/${TICKS_PER_CANDLE} | candles: ${candles.length} | subscribers: ${subscribers.size}`
     );
 
     addTick(price);
-    checkOpenSignals(price);
 
+    await checkOpenSignals(
+      price
+    );
   } catch (error) {
-
     console.error(
       "Market monitor error:",
       error.message
     );
-
   }
-
 }
 
-
-// ===============================
-// CHECK MARKET EVERY 30 SECONDS
-// ===============================
+/* =========================================================
+   START MONITOR
+========================================================= */
 
 setInterval(
   monitorMarket,
   30000
 );
 
-
-// ===============================
-// INITIAL MARKET CHECK
-// ===============================
-
 monitorMarket();
 
+/* =========================================================
+   TELEGRAM ERROR HANDLING
+========================================================= */
 
-// ===============================
-// START SERVER
-// ===============================
+bot.on(
+  "polling_error",
+  error => {
+    console.error(
+      "Telegram polling error:",
+      error.message
+    );
+  }
+);
 
-app.listen(PORT, () => {
+/* =========================================================
+   SERVER START
+========================================================= */
 
-  console.log(
-    `🔥 MONEY MAKING MACHINE BOT running on port ${PORT}`
-  );
+app.listen(
+  PORT,
+  () => {
+    console.log(
+      `🔥 ${BOT_NAME} running on port ${PORT}`
+    );
 
-});
+    console.log(
+      `📊 Symbol: ${SYMBOL}`
+    );
+
+    console.log(
+      `🤖 Automatic signals: ON`
+    );
+
+    console.log(
+      `🔕 Stop Alerts: available`
+    );
+  }
+);
