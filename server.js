@@ -57,7 +57,6 @@ const mainMenu = {
   reply_markup: {
     keyboard: [
       ["📊 XAUUSD Signal", "💰 Live Price"],
-      ["🔔 Auto Signals"],
       ["📖 How It Works", "⚙️ Settings"]
     ],
     resize_keyboard: true,
@@ -782,6 +781,8 @@ Your XAUUSD trading assistant.
 🎯 200–300 pip targets
 🛡️ Risk levels
 
+🔔 Automatic signals are already ON for you - no setup needed. You'll receive every entry alert here.
+
 Choose an option below:`,
     mainMenu
   );
@@ -887,37 +888,6 @@ ${status}
 
 
   // ===============================
-  // 🔔 AUTO SIGNALS
-  // ===============================
-
-  if (msg.text === "🔔 Auto Signals") {
-
-    // Already subscribed by autoSubscribe() above; this just confirms it.
-    bot.sendMessage(
-      msg.chat.id,
-
-`🔔 AUTOMATIC SIGNALS ENABLED
-
-MONEY MAKING MACHINE BOT will monitor XAUUSD automatically.
-
-You will receive an alert when a complete trading setup is confirmed.
-
-📊 BOS / CHoCH
-💧 Liquidity
-🟨 FVG
-🟦 Order Block
-✅ Entry confirmation
-🎯 200–300 pip target
-
-You don't need to keep typing /signal.
-
-Note: the bot builds its own candle history from live prices, so the first real setups may take a couple of hours to appear after each restart.`
-    );
-
-  }
-
-
-  // ===============================
   // 📖 HOW IT WORKS
   // ===============================
 
@@ -953,7 +923,7 @@ Price must retest the FVG/order block zone with a confirming candle
 🛡️ Risk
 Stop Loss is calculated from the order block / structure point
 
-🚨 When all required conditions are confirmed, the bot automatically sends an entry alert to everyone with Auto Signals on.
+🚨 When all required conditions are confirmed, the bot automatically sends an entry alert to every user. Automatic signals are always on - nothing to switch on.
 
 ⏳ The bot builds its price history live, so it needs some uptime after each restart before it has enough candles to analyze.`
     );
