@@ -263,34 +263,38 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
 // GET LIVE XAUUSD PRICE
 // ===============================
 
+let cached = { price: null, time: 0 };
+
 async function getGoldPrice() {
-
-  const apiKey = process.env.GOLDPRICE_API_KEY;
-
-  if (!apiKey) {
-    throw new Error("GOLDPRICE_API_KEY is missing");
+  if (cached.price && Date.now() - cached.time < 20000) {
+    return cached.price;
   }
 
-  const response = await axios.get(
-    "https://api.goldprice.dev/v1/prices",
-    {
-      params: {
-        symbol: "XAU-USD-SPOT"
-      },
-      headers: {
-        Authorization: `Bearer ${apiKey}`
-      },
-      timeout: 10000
+  const sources = [
+    async () => Number((await axios.get(
+      "https://xaus.com/api/v1/spot?compact=1",
+      { timeout: 10000 })).data.xau.price),
+    async () => Number((await axios.get(
+      "https://api.gold-api.com/price/XAU",
+      { timeout: 10000 })).data.price)
+  ];
+
+  for (const source of sources) {
+    try {
+      const p = await source();
+      if (p > 0) {
+        cached = { price: p, time: Date.now() };
+        return p;
+      }
+    } catch (e) {
+      console.error("Price source failed:", e.response?.status || e.message);
     }
-  );
-
-  const data = response.data;
-
-  if (!data || !data.symbols || !data.symbols[0] || !data.symbols[0].price) {
-    throw new Error("Invalid GoldPrice data");
   }
 
-  return Number(data.symbols[0].price);
+  if (cached.price && Date.now() - cached.time < 600000) {
+    return cached.price;
+  }
+  throw new Error("All price sources failed");
 }
 
 
