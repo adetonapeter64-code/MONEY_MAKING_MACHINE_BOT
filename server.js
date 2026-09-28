@@ -265,18 +265,17 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
 
 async function getGoldPrice() {
 
-  const apiKey = process.env.TWELVE_DATA_API_KEY;
+  const apiKey = process.env.GOLDPRICE_API_KEY;
 
   if (!apiKey) {
-    throw new Error("TWELVE_DATA_API_KEY is missing");
+    throw new Error("GOLDPRICE_API_KEY is missing");
   }
 
   const response = await axios.get(
-    "https://api.twelvedata.com/price",
+    "https://api.goldprice.dev/v1/latest",
     {
-      params: {
-        symbol: "XAU/USD",
-        apikey: apiKey
+      headers: {
+        "x-api-key": apiKey
       },
       timeout: 10000
     }
@@ -284,12 +283,8 @@ async function getGoldPrice() {
 
   const data = response.data;
 
-  if (data.status === "error") {
-    throw new Error(data.message || "Twelve Data error");
-  }
-
-  if (!data.price) {
-    throw new Error("Invalid XAU/USD data");
+  if (!data || !data.price) {
+    throw new Error("Invalid GoldPrice data");
   }
 
   return Number(data.price);
