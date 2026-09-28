@@ -272,10 +272,13 @@ async function getGoldPrice() {
   }
 
   const response = await axios.get(
-    "https://api.goldprice.dev/v1/latest",
+    "https://api.goldprice.dev/v1/prices",
     {
+      params: {
+        symbol: "XAU-USD-SPOT"
+      },
       headers: {
-        "x-api-key": apiKey
+        Authorization: `Bearer ${apiKey}`
       },
       timeout: 10000
     }
@@ -283,11 +286,11 @@ async function getGoldPrice() {
 
   const data = response.data;
 
-  if (!data || !data.price) {
+  if (!data || !data.symbols || !data.symbols[0] || !data.symbols[0].price) {
     throw new Error("Invalid GoldPrice data");
   }
 
-  return Number(data.price);
+  return Number(data.symbols[0].price);
 }
 
 
