@@ -118,8 +118,8 @@ async function refreshLTF() {
       analyzeMarket();
     }
   } catch (e) {
-    lastFetchError = e.message;
-    console.error("5m refresh failed:", e.message);
+    lastFetchError = e.response?.data?.message || e.message;
+    console.error("5m refresh failed:", e.response?.data || e.message);
   }
 }
 
@@ -559,6 +559,7 @@ A signal is sent automatically when all conditions confirm.`);
       const price = await getGoldPrice();
       bot.sendMessage(chatId, `💰 XAUUSD PRICE\n\n🪙 ${price.toFixed(2)}\n⏱️ Updated every few minutes`);
     } catch (e) {
+      console.error("Live price error:", e.response?.data || e.message);
       bot.sendMessage(chatId, "⚠️ Unable to retrieve the current XAUUSD price.");
     }
   }
