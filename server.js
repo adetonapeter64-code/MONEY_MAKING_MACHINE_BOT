@@ -3,15 +3,22 @@ const express = require("express");
 const axios = require("axios");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+
+const PORT = process.env.PORT || 10000;
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TWELVE_DATA_API_KEY = process.env.TWELVE_DATA_API_KEY;
 
-const ADMIN_USER = process.env.ADMIN_USER || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "changeme123";
+const PUBLIC_URL =
+  process.env.PUBLIC_URL ||
+  process.env.RENDER_EXTERNAL_URL;
 
-const SYMBOL = "XAU/USD";
+const WEBHOOK_SECRET =
+  process.env.TELEGRAM_WEBHOOK_SECRET || "";
+
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASSWORD =
+  process.env.ADMIN_PASSWORD || "changeme123";
 
 if (!BOT_TOKEN) {
   console.error("BOT_TOKEN is missing");
@@ -23,103 +30,277 @@ if (!TWELVE_DATA_API_KEY) {
   process.exit(1);
 }
 
+if (!PUBLIC_URL) {
+  console.error(
+    "PUBLIC_URL / RENDER_EXTERNAL_URL is missing"
+  );
+  process.exit(1);
+}
+
+
+/* =========================================================
+   TELEGRAM
+   ========================================================= */
+
+// IMPORTANT:
+// We deliberately DO NOT use polling.
+// Webhook mode prevents the 409:
+// "terminated by other getUpdates request"
+
 const bot = new TelegramBot(BOT_TOKEN, {
-  polling: true
+  polling: false
 });
 
+const WEBHOOK_PATH = "/telegram/webhook";
+
+
+/* =========================================================
+   EXPRESS
+   ========================================================= */
+
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 
-// ================================================================
-// CONFIGURATION
-// ================================================================
+/* =========================================================
+   BASIC BOT MENU
+   ========================================================= */
 
-const TIMEFRAMES = {
-  HTF: "4h",
-  MID: "1h",
-  SETUP: "15min",
-  ENTRY: "5min"
+const mainMenu = {
+  reply_markup: {
+    keyboard: [
+      ["📊 XAUUSD Signal", "💰 Live Price"],
+      ["🔔 Auto Signals", "🔕 Stop Alerts"],
+      ["📖 How It Works", "⚙️ Settings"]
+    ],
+    resize_keyboard: true,
+    is_persistent: true
+  }
 };
 
-const DATA_REFRESH_MS = 60 * 1000;
 
-const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
-const SETUP_EXPIRY_MS = 3 * 60 * 60 * 1000;
-
-const MAX_SIGNAL_HISTORY = 100;
-
-const HTF_CANDLES = 250;
-const MID_CANDLES = 250;
-const SETUP_CANDLES = 300;
-const ENTRY_CANDLES = 300;
-
-const SWING_LOOKBACK = 2;
-
-const MIN_FVG_SIZE = 0.30;
-
-// Maximum distance price may move away from the zone
-// before the setup becomes invalid.
-const MAX_ENTRY_DISTANCE = 12.0;
-
-// Minimum displacement candle body.
-const MIN_DISPLACEMENT = 1.0;
-
-
-// ================================================================
-// STATE
-// ================================================================
+/* =========================================================
+   SUBSCRIBERS
+   ========================================================= */
 
 const subscribers = new Map();
 
+
+/* =========================================================
+   SIGNAL HISTORY
+   ========================================================= */
+
 const signalHistory = [];
+
+const MAX_SIGNAL_HISTORY = 100;
+
+
+/* =========================================================
+   MARKET DATA
+   ========================================================= */
+
+const SYMBOL = "XAU/USD";
+
+const BASE_INTERVAL = "5min";
+
+// 400 x 5-minute candles = about 33 hours.
+// Enough to build:
+// 4H
+// 1H
+// 15M
+// 5M
+const HISTORY_SIZE = 400;
+
+let candles5m = [];
+
+let lastMarketUpdate = 0;
+let lastMarketPrice = null;
+
+let marketBusy = false;
+
+
+/* =========================================================
+   STRATEGY SETTINGS
+   ========================================================= */
+
+const SWING_LOOKBACK = 2;
+
+const SETUP_EXPIRY_MS =
+  3 * 60 * 60 * 1000;
+
+const SIGNAL_COOLDOWN_MS =
+  30 * 60 * 1000;
+
+const SIGNAL_MAX_HOLD_MS =
+  12 * 60 * 60 * 1000;
+
+const PIP_SIZE = 0.10;
+
+// Original bot target range.
+// We use the midpoint = 250 pips = $25.
+const TP_PIPS_MIN = 200;
+const TP_PIPS_MAX = 300;
+
+const TP_PIPS =
+  (TP_PIPS_MIN + TP_PIPS_MAX) / 2;
+
+const TP_DISTANCE =
+  TP_PIPS * PIP_SIZE;
+
+// Small XAUUSD protection buffer.
+const SL_BUFFER = 1.0;
+
+
+/* =========================================================
+   TOP-DOWN STATE
+   ========================================================= */
 
 let pendingSetup = null;
 
 let lastSignalTime = 0;
 
-let lastAnalysisTime = 0;
 
-let cachedMarket = {
-  htf: [],
-  mid: [],
-  setup: [],
-  entry: [],
-  price: null,
-  updatedAt: 0
-};
+/*
+pendingSetup:
+
+{
+  direction: "bullish" | "bearish",
+
+  label: "BOS" | "CHoCH",
+
+  createdAt,
+
+  liquiditySweep,
+
+  bos,
+
+  fvg,
+
+  orderBlock,
+
+  entryZoneTop,
+
+  entryZoneBottom,
+
+  structureLow,
+
+  structureHigh
+}
+*/
 
 
-// ================================================================
-// ADMIN AUTH
-// ================================================================
+/* =========================================================
+   TELEGRAM WEBHOOK
+   ========================================================= */
+
+app.post(WEBHOOK_PATH, (req, res) => {
+
+  try {
+
+    if (WEBHOOK_SECRET) {
+
+      const incomingSecret =
+        req.headers["x-telegram-bot-api-secret-token"];
+
+      if (incomingSecret !== WEBHOOK_SECRET) {
+        return res.sendStatus(403);
+      }
+
+    }
+
+    bot.processUpdate(req.body);
+
+    res.sendStatus(200);
+
+  } catch (error) {
+
+    console.error(
+      "Webhook processing error:",
+      error.message
+    );
+
+    res.sendStatus(500);
+  }
+
+});
+
+
+/* =========================================================
+   HEALTH
+   ========================================================= */
+
+app.get("/", (req, res) => {
+
+  res.json({
+    status: "online",
+    bot: "MONEY MAKING MACHINE BOT",
+    strategy: "4H → 1H → 15M → 5M",
+    market: SYMBOL,
+    candles5m: candles5m.length,
+    pendingSetup: !!pendingSetup,
+    signals: signalHistory.length
+  });
+
+});
+
+
+app.get("/health", (req, res) => {
+
+  res.json({
+    ok: true,
+    marketData: lastMarketPrice !== null,
+    candles5m: candles5m.length,
+    lastMarketUpdate:
+      lastMarketUpdate
+        ? new Date(lastMarketUpdate).toISOString()
+        : null
+  });
+
+});
+
+
+/* =========================================================
+   ADMIN AUTH
+   ========================================================= */
 
 function requireAdminAuth(req, res, next) {
 
-  const authHeader = req.headers.authorization;
+  const authHeader =
+    req.headers.authorization;
 
-  if (!authHeader || !authHeader.startsWith("Basic ")) {
+  if (
+    !authHeader ||
+    !authHeader.startsWith("Basic ")
+  ) {
 
     res.set(
       "WWW-Authenticate",
       'Basic realm="Admin Panel"'
     );
 
-    return res.status(401).send("Authentication required.");
+    return res
+      .status(401)
+      .send("Authentication required.");
   }
 
-  const decoded = Buffer
-    .from(authHeader.split(" ")[1], "base64")
-    .toString();
+  const decoded =
+    Buffer.from(
+      authHeader.split(" ")[1],
+      "base64"
+    ).toString();
 
-  const separator = decoded.indexOf(":");
+  const separator =
+    decoded.indexOf(":");
 
-  const user = separator >= 0
-    ? decoded.slice(0, separator)
-    : "";
+  const user =
+    separator >= 0
+      ? decoded.slice(0, separator)
+      : decoded;
 
-  const pass = separator >= 0
-    ? decoded.slice(separator + 1)
-    : "";
+  const pass =
+    separator >= 0
+      ? decoded.slice(separator + 1)
+      : "";
 
   if (
     user === ADMIN_USER &&
@@ -133,224 +314,59 @@ function requireAdminAuth(req, res, next) {
     'Basic realm="Admin Panel"'
   );
 
-  return res.status(401).send("Invalid credentials.");
+  return res
+    .status(401)
+    .send("Invalid credentials.");
 }
 
 
-// ================================================================
-// TELEGRAM MENU
-// ================================================================
-
-const mainMenu = {
-
-  reply_markup: {
-
-    keyboard: [
-      ["📊 XAUUSD Signal", "💰 Live Price"],
-      ["🔔 Auto Signals", "🔕 Stop Alerts"],
-      ["📖 How It Works", "⚙️ Settings"]
-    ],
-
-    resize_keyboard: true,
-
-    is_persistent: true
-  }
-};
-
-
-// ================================================================
-// HTML HELPERS
-// ================================================================
+/* =========================================================
+   HTML ESCAPE
+   ========================================================= */
 
 function escapeHtml(str) {
 
-  if (str === null || str === undefined) {
+  if (
+    str === null ||
+    str === undefined
+  ) {
     return "";
   }
 
   return String(str)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 
-function formatUptime(ms) {
-
-  const totalMinutes = Math.floor(ms / 60000);
-
-  const hours = Math.floor(totalMinutes / 60);
-
-  const minutes = totalMinutes % 60;
-
-  return `${hours}h ${minutes}m`;
-}
-
-
-// ================================================================
-// WEB SERVER
-// ================================================================
-
-app.get("/", (req, res) => {
-
-  res.send(
-    "🔥 MONEY MAKING MACHINE BOT is running."
-  );
-
-});
-
-
-// ================================================================
-// ADMIN PANEL
-// ================================================================
-
-const botStartedAt = Date.now();
+/* =========================================================
+   ADMIN PANEL
+   ========================================================= */
 
 app.get(
   "/admin",
   requireAdminAuth,
   (req, res) => {
 
-    const price =
-      cachedMarket.price;
-
-    const subscriberRows =
-      [...subscribers.entries()]
-        .map(([chatId, info]) => `
-
-<tr>
-
-<td>
-${escapeHtml(info.firstName)}
-${info.username
-  ? " (@" + escapeHtml(info.username) + ")"
-  : ""}
-</td>
-
-<td>${chatId}</td>
-
-<td>
-${new Date(info.joinedAt).toLocaleString()}
-</td>
-
-<td>
-
-<form
-method="POST"
-action="/admin/remove"
-style="margin:0;"
->
-
-<input
-type="hidden"
-name="chatId"
-value="${chatId}"
->
-
-<button
-type="submit"
-class="danger"
->
-Remove
-</button>
-
-</form>
-
-</td>
-
-</tr>
-
-`)
-.join("")
-
-||
-`<tr>
-<td colspan="4">
-No subscribers yet.
-</td>
-</tr>`;
-
-
-    const statusBadge = {
-
-      open: "⏳ Open",
-
-      win: "✅ Win",
-
-      loss: "❌ Loss"
-
-    };
-
-
-    const signalRows =
-      signalHistory
-        .slice(0, 20)
-        .map(s => `
-
-<tr>
-
-<td>
-${new Date(s.time).toLocaleString()}
-</td>
-
-<td>
-${escapeHtml(s.label)}
-</td>
-
-<td>
-${s.direction}
-</td>
-
-<td>
-${Number(s.entryPrice).toFixed(2)}
-</td>
-
-<td>
-${Number(s.stopLoss).toFixed(2)}
-</td>
-
-<td>
-${Number(s.takeProfit).toFixed(2)}
-</td>
-
-<td>
-${statusBadge[s.status] || s.status}
-</td>
-
-</tr>
-
-`)
-.join("")
-
-||
-`<tr>
-<td colspan="7">
-No signals fired yet.
-</td>
-</tr>`;
-
-
     const wins =
       signalHistory.filter(
         s => s.status === "win"
       ).length;
-
 
     const losses =
       signalHistory.filter(
         s => s.status === "loss"
       ).length;
 
-
-    const openCount =
+    const open =
       signalHistory.filter(
         s => s.status === "open"
       ).length;
 
-
     const decided =
       wins + losses;
-
 
     const winRate =
       decided > 0
@@ -358,18 +374,117 @@ No signals fired yet.
         : "—";
 
 
-    let setupStatus =
-      "No active setup right now.";
+    const setupStatus =
+      pendingSetup
+        ? `
+          ${pendingSetup.direction.toUpperCase()}
+          ${pendingSetup.label}
+          — waiting for 5M entry confirmation
+        `
+        : "No active setup.";
 
 
-    if (pendingSetup) {
+    const subscriberRows =
+      [...subscribers.entries()]
+        .map(([chatId, info]) => {
 
-      setupStatus =
-        `Watching ${pendingSetup.direction.toUpperCase()}
-        ${pendingSetup.label}
-        setup.`;
+          return `
+            <tr>
+              <td>
+                ${escapeHtml(info.firstName)}
+                ${
+                  info.username
+                    ? " @" +
+                      escapeHtml(info.username)
+                    : ""
+                }
+              </td>
 
-    }
+              <td>${chatId}</td>
+
+              <td>
+                ${new Date(
+                  info.joinedAt
+                ).toLocaleString()}
+              </td>
+
+              <td>
+
+                <form
+                  method="POST"
+                  action="/admin/remove"
+                >
+
+                  <input
+                    type="hidden"
+                    name="chatId"
+                    value="${chatId}"
+                  >
+
+                  <button class="danger">
+                    Remove
+                  </button>
+
+                </form>
+
+              </td>
+            </tr>
+          `;
+
+        })
+        .join("");
+
+
+    const signalRows =
+      signalHistory
+        .slice(0, 30)
+        .map(s => {
+
+          const result =
+            s.status === "win"
+              ? "✅ Win"
+              : s.status === "loss"
+                ? "❌ Loss"
+                : "⏳ Open";
+
+          return `
+            <tr>
+
+              <td>
+                ${new Date(
+                  s.time
+                ).toLocaleString()}
+              </td>
+
+              <td>
+                ${escapeHtml(s.label)}
+              </td>
+
+              <td>
+                ${s.direction}
+              </td>
+
+              <td>
+                ${s.entryPrice.toFixed(2)}
+              </td>
+
+              <td>
+                ${s.stopLoss.toFixed(2)}
+              </td>
+
+              <td>
+                ${s.takeProfit.toFixed(2)}
+              </td>
+
+              <td>
+                ${result}
+              </td>
+
+            </tr>
+          `;
+
+        })
+        .join("");
 
 
     res.send(`
@@ -384,164 +499,60 @@ No signals fired yet.
 content="width=device-width, initial-scale=1">
 
 <title>
-Money Making Machine - Admin
+Money Making Machine
 </title>
 
 <style>
 
 body {
-
-font-family:
--apple-system,
-Arial,
-sans-serif;
-
-background:#0f1115;
-
-color:#eee;
-
-margin:0;
-
-padding:16px;
-
-}
-
-h1 {
-
-font-size:1.3rem;
-
-}
-
-h2 {
-
-font-size:1.05rem;
-
-margin-top:28px;
-
-color:#f5c542;
-
-}
-
-.stats {
-
-display:flex;
-
-flex-wrap:wrap;
-
-gap:10px;
-
-margin:12px 0;
-
+  font-family: Arial, sans-serif;
+  background:#0f1115;
+  color:#eee;
+  padding:16px;
 }
 
 .card {
-
-background:#1b1f27;
-
-border-radius:10px;
-
-padding:12px 16px;
-
-flex:1 1 140px;
-
-}
-
-.card .label {
-
-font-size:.75rem;
-
-color:#999;
-
-}
-
-.card .value {
-
-font-size:1.3rem;
-
-font-weight:bold;
-
-margin-top:4px;
-
+  background:#1b1f27;
+  padding:15px;
+  margin:8px 0;
+  border-radius:10px;
 }
 
 table {
-
-width:100%;
-
-border-collapse:collapse;
-
-margin-top:8px;
-
-font-size:.85rem;
-
+  width:100%;
+  border-collapse:collapse;
+  font-size:13px;
 }
 
-th,td {
-
-text-align:left;
-
-padding:8px 6px;
-
-border-bottom:
-1px solid #2a2f3a;
-
-}
-
-th {
-
-color:#aaa;
-
-font-weight:normal;
-
-}
-
-button {
-
-background:#2b6fe0;
-
-color:white;
-
-border:none;
-
-padding:8px 14px;
-
-border-radius:6px;
-
-font-size:.85rem;
-
-}
-
-button.danger {
-
-background:#c0392b;
-
-}
-
-textarea {
-
-width:100%;
-
-box-sizing:border-box;
-
-background:#1b1f27;
-
-color:#eee;
-
-border:
-1px solid #333;
-
-border-radius:6px;
-
-padding:8px;
-
-font-size:.9rem;
-
+th, td {
+  padding:8px;
+  border-bottom:1px solid #333;
+  text-align:left;
 }
 
 .scroll {
+  overflow-x:auto;
+}
 
-overflow-x:auto;
+button {
+  background:#2878e8;
+  color:white;
+  border:0;
+  padding:8px 12px;
+  border-radius:6px;
+}
 
+.danger {
+  background:#c0392b;
+}
+
+textarea {
+  width:100%;
+  box-sizing:border-box;
+  background:#181b22;
+  color:white;
+  border:1px solid #333;
+  padding:10px;
 }
 
 </style>
@@ -550,153 +561,63 @@ overflow-x:auto;
 
 <body>
 
-<h1>
-🔥 Money Making Machine - Admin
-</h1>
-
-<div class="stats">
+<h2>
+🔥 MONEY MAKING MACHINE
+</h2>
 
 <div class="card">
-
-<div class="label">
-Bot uptime
+<b>Market:</b> ${SYMBOL}
 </div>
-
-<div class="value">
-${formatUptime(
-  Date.now() - botStartedAt
-)}
-</div>
-
-</div>
-
 
 <div class="card">
-
-<div class="label">
-Live price
+<b>Price:</b>
+${
+  lastMarketPrice !== null
+    ? lastMarketPrice.toFixed(2)
+    : "—"
+}
 </div>
-
-<div class="value">
-${price
-  ? Number(price).toFixed(2)
-  : "—"}
-</div>
-
-</div>
-
 
 <div class="card">
-
-<div class="label">
-4H candles
+<b>5M candles:</b>
+${candles5m.length}
 </div>
-
-<div class="value">
-${cachedMarket.htf.length}
-</div>
-
-</div>
-
 
 <div class="card">
-
-<div class="label">
-15M candles
-</div>
-
-<div class="value">
-${cachedMarket.setup.length}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Subscribers
-</div>
-
-<div class="value">
+<b>Subscribers:</b>
 ${subscribers.size}
 </div>
 
+<div class="card">
+<b>Signals:</b>
+${signalHistory.length}
 </div>
 
+<div class="card">
+<b>Wins:</b> ${wins}
+<br>
+<b>Losses:</b> ${losses}
+<br>
+<b>Open:</b> ${open}
+<br>
+<b>Win rate:</b>
+${winRate}${decided ? "%" : ""}
 </div>
-
-
-<div class="stats">
 
 <div class="card">
 
-<div class="label">
-Win rate
-</div>
+<b>Top-down setup:</b>
 
-<div class="value">
-${winRate}${decided > 0 ? "%" : ""}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Wins
-</div>
-
-<div class="value">
-${wins}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Losses
-</div>
-
-<div class="value">
-${losses}
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-Open
-</div>
-
-<div class="value">
-${openCount}
-</div>
-
-</div>
-
-</div>
-
-
-<p>
-
-<strong>
-Setup status:
-</strong>
+<br><br>
 
 ${escapeHtml(setupStatus)}
 
-</p>
+</div>
 
 
-<h2>
-Send manual message
-</h2>
+<h3>
+Broadcast
+</h3>
 
 <form
 method="POST"
@@ -705,36 +626,32 @@ action="/admin/broadcast"
 
 <textarea
 name="message"
-rows="3"
+rows="4"
 placeholder="Message..."
 ></textarea>
 
 <br><br>
 
-<button
-type="submit"
->
+<button>
 Send Broadcast
 </button>
 
 </form>
 
 
-<h2>
-Subscribers (${subscribers.size})
-</h2>
+<h3>
+Subscribers
+</h3>
 
 <div class="scroll">
 
 <table>
 
 <tr>
-
 <th>Name</th>
-<th>Chat ID</th>
+<th>ID</th>
 <th>Joined</th>
 <th></th>
-
 </tr>
 
 ${subscriberRows}
@@ -744,16 +661,15 @@ ${subscriberRows}
 </div>
 
 
-<h2>
+<h3>
 Recent Signals
-</h2>
+</h3>
 
 <div class="scroll">
 
 <table>
 
 <tr>
-
 <th>Time</th>
 <th>Type</th>
 <th>Direction</th>
@@ -761,7 +677,6 @@ Recent Signals
 <th>SL</th>
 <th>TP</th>
 <th>Result</th>
-
 </tr>
 
 ${signalRows}
@@ -780,9 +695,9 @@ ${signalRows}
 );
 
 
-// ================================================================
-// ADMIN REMOVE
-// ================================================================
+/* =========================================================
+   ADMIN REMOVE
+   ========================================================= */
 
 app.post(
   "/admin/remove",
@@ -795,14 +710,13 @@ app.post(
     subscribers.delete(chatId);
 
     res.redirect("/admin");
-
   }
 );
 
 
-// ================================================================
-// ADMIN BROADCAST
-// ================================================================
+/* =========================================================
+   ADMIN BROADCAST
+   ========================================================= */
 
 app.post(
   "/admin/broadcast",
@@ -810,7 +724,9 @@ app.post(
   async (req, res) => {
 
     const text =
-      (req.body.message || "").trim();
+      String(
+        req.body.message || ""
+      ).trim();
 
     if (text) {
 
@@ -818,240 +734,409 @@ app.post(
         const chatId of subscribers.keys()
       ) {
 
-        bot.sendMessage(
-          chatId,
-          `📢 ${text}`
-        ).catch(err => {
+        try {
+
+          await bot.sendMessage(
+            chatId,
+            `📢 ${text}`
+          );
+
+        } catch (error) {
 
           console.error(
             `Broadcast failed for ${chatId}:`,
-            err.message
+            error.message
           );
 
-        });
+        }
 
       }
 
     }
 
     res.redirect("/admin");
-
   }
 );
 
 
-// ================================================================
-// TWELVE DATA
-// ================================================================
+/* =========================================================
+   TIME HELPERS
+   ========================================================= */
 
-async function getTimeSeries(
-  interval,
-  outputsize
+function timestampMs(datetime) {
+
+  // Twelve Data forex timestamps are UTC
+  // when timezone=UTC is requested.
+
+  return new Date(
+    datetime.replace(" ", "T") + "Z"
+  ).getTime();
+
+}
+
+
+function floorTimestamp(
+  timestamp,
+  minutes
 ) {
 
-  const response =
-    await axios.get(
-      "https://api.twelvedata.com/time_series",
-      {
-        timeout: 15000,
+  const size =
+    minutes * 60 * 1000;
 
-        params: {
+  return (
+    Math.floor(timestamp / size) *
+    size
+  );
 
-          symbol: SYMBOL,
+}
 
-          interval,
 
-          outputsize,
+/* =========================================================
+   TWELVE DATA
+   ========================================================= */
 
-          order: "asc",
+async function fetch5mHistory() {
 
-          timezone: "UTC",
+  if (marketBusy) {
+    return;
+  }
 
-          include_ohlc: true,
+  marketBusy = true;
 
-          apikey:
-            TWELVE_DATA_API_KEY
+  try {
 
+    const response =
+      await axios.get(
+        "https://api.twelvedata.com/time_series",
+        {
+          timeout: 15000,
+
+          params: {
+            symbol: SYMBOL,
+            interval: BASE_INTERVAL,
+            outputsize: HISTORY_SIZE,
+            timezone: "UTC",
+            order: "ASC",
+            apikey: TWELVE_DATA_API_KEY
+          }
         }
-
-      }
-    );
-
-
-  const data = response.data;
-
-
-  if (
-    !data ||
-    data.status === "error"
-  ) {
-
-    throw new Error(
-      data?.message ||
-      "Twelve Data returned an error"
-    );
-
-  }
-
-
-  if (
-    !Array.isArray(data.values)
-  ) {
-
-    throw new Error(
-      `No ${interval} candle data returned`
-    );
-
-  }
-
-
-  const candles =
-    data.values
-      .map(v => ({
-
-        time:
-          new Date(v.datetime).getTime(),
-
-        open:
-          Number(v.open),
-
-        high:
-          Number(v.high),
-
-        low:
-          Number(v.low),
-
-        close:
-          Number(v.close)
-
-      }))
-      .filter(c =>
-        Number.isFinite(c.open) &&
-        Number.isFinite(c.high) &&
-        Number.isFinite(c.low) &&
-        Number.isFinite(c.close) &&
-        Number.isFinite(c.time)
-      )
-      .sort(
-        (a, b) =>
-          a.time - b.time
       );
 
 
-  /*
-   * The newest intraday candle may still be forming.
-   *
-   * We remove it so the strategy only analyzes
-   * COMPLETED candles.
-   */
+    const data =
+      response.data;
 
-  if (candles.length > 2) {
 
-    candles.pop();
+    if (
+      data.status === "error"
+    ) {
+
+      throw new Error(
+        data.message ||
+        "Twelve Data returned an error."
+      );
+
+    }
+
+
+    if (
+      !Array.isArray(data.values) ||
+      data.values.length === 0
+    ) {
+
+      throw new Error(
+        "No 5M candles returned."
+      );
+
+    }
+
+
+    const now =
+      Date.now();
+
+
+    const parsed =
+      data.values
+        .map(row => {
+
+          const time =
+            timestampMs(
+              row.datetime
+            );
+
+          return {
+
+            time,
+
+            open:
+              Number(row.open),
+
+            high:
+              Number(row.high),
+
+            low:
+              Number(row.low),
+
+            close:
+              Number(row.close)
+
+          };
+
+        })
+        .filter(c => {
+
+          if (
+            !Number.isFinite(c.open) ||
+            !Number.isFinite(c.high) ||
+            !Number.isFinite(c.low) ||
+            !Number.isFinite(c.close)
+          ) {
+            return false;
+          }
+
+          // Only CLOSED 5M candles.
+          return (
+            c.time + 5 * 60 * 1000
+            <= now
+          );
+
+        })
+        .sort(
+          (a, b) =>
+            a.time - b.time
+        );
+
+
+    if (parsed.length < 100) {
+
+      throw new Error(
+        `Only ${parsed.length} closed 5M candles available.`
+      );
+
+    }
+
+
+    candles5m = dedupeCandles(
+      parsed
+    ).slice(-HISTORY_SIZE);
+
+
+    lastMarketPrice =
+      candles5m[
+        candles5m.length - 1
+      ].close;
+
+    lastMarketUpdate =
+      Date.now();
+
+
+    console.log(
+      `[MARKET] ${SYMBOL} ${lastMarketPrice.toFixed(2)} | 5M candles: ${candles5m.length}`
+    );
+
+
+    runStrategy();
+
+
+    updateOpenSignalsFromLatestCandle();
+
+
+  } catch (error) {
+
+    if (
+      error.response?.status === 429
+    ) {
+
+      console.error(
+        "[MARKET] Twelve Data 429 - quota/rate limit."
+      );
+
+    } else {
+
+      console.error(
+        "[MARKET ERROR]",
+        error.response?.data ||
+        error.message
+      );
+
+    }
+
+  } finally {
+
+    marketBusy = false;
 
   }
-
-
-  return candles;
 
 }
 
 
-// ================================================================
-// LIVE PRICE
-// ================================================================
+function dedupeCandles(
+  candles
+) {
 
-async function getGoldPrice() {
+  const map = new Map();
 
-  /*
-   * We use Twelve Data's latest 5-minute close
-   * for the market display.
-   *
-   * The strategy itself works only from completed
-   * OHLC candles.
-   */
-
-  const candles =
-    await getTimeSeries(
-      "5min",
-      3
+  for (
+    const candle of candles
+  ) {
+    map.set(
+      candle.time,
+      candle
     );
-
-
-  if (!candles.length) {
-
-    throw new Error(
-      "No current XAUUSD price"
-    );
-
   }
 
-
-  const price =
-    candles[candles.length - 1].close;
-
-
-  cachedMarket.price =
-    price;
-
-
-  return price;
+  return [
+    ...map.values()
+  ].sort(
+    (a, b) =>
+      a.time - b.time
+  );
 
 }
 
 
-// ================================================================
-// SWING DETECTION
-// ================================================================
+/* =========================================================
+   AGGREGATE 5M → 15M / 1H / 4H
+   ========================================================= */
+
+function aggregateCandles(
+  source,
+  minutes
+) {
+
+  const groups = new Map();
+
+  for (
+    const c of source
+  ) {
+
+    const bucket =
+      floorTimestamp(
+        c.time,
+        minutes
+      );
+
+    if (
+      !groups.has(bucket)
+    ) {
+
+      groups.set(
+        bucket,
+        {
+          time: bucket,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+          count: 1
+        }
+      );
+
+    } else {
+
+      const g =
+        groups.get(bucket);
+
+      g.high =
+        Math.max(
+          g.high,
+          c.high
+        );
+
+      g.low =
+        Math.min(
+          g.low,
+          c.low
+        );
+
+      g.close =
+        c.close;
+
+      g.count++;
+
+    }
+
+  }
+
+
+  const expected =
+    minutes / 5;
+
+
+  return [
+    ...groups.values()
+  ]
+    .filter(
+      g =>
+        g.count === expected
+    )
+    .map(
+      g => ({
+        time: g.time,
+        open: g.open,
+        high: g.high,
+        low: g.low,
+        close: g.close
+      })
+    )
+    .sort(
+      (a, b) =>
+        a.time - b.time
+    );
+
+}
+
+
+/* =========================================================
+   SWINGS
+   ========================================================= */
 
 function findSwings(
   candles,
-  lookback = SWING_LOOKBACK
+  lookback = 2
 ) {
 
-  const swings = [];
-
+  const highs = [];
+  const lows = [];
 
   for (
     let i = lookback;
-    i < candles.length - lookback;
+    i <
+      candles.length -
+      lookback;
     i++
   ) {
 
-    const c =
+    const current =
       candles[i];
-
 
     let isHigh = true;
     let isLow = true;
 
 
     for (
-      let j = i - lookback;
-      j <= i + lookback;
+      let j = 1;
+      j <= lookback;
       j++
     ) {
 
-      if (j === i) continue;
-
-
       if (
-        candles[j].high >
-        c.high
+        candles[i - j].high >
+        current.high ||
+        candles[i + j].high >
+        current.high
       ) {
-
         isHigh = false;
-
       }
 
 
       if (
-        candles[j].low <
-        c.low
+        candles[i - j].low <
+        current.low ||
+        candles[i + j].low <
+        current.low
       ) {
-
         isLow = false;
-
       }
 
     }
@@ -1059,16 +1144,10 @@ function findSwings(
 
     if (isHigh) {
 
-      swings.push({
-
+      highs.push({
         index: i,
-
-        price: c.high,
-
-        type: "high",
-
-        time: c.time
-
+        price: current.high,
+        time: current.time
       });
 
     }
@@ -1076,16 +1155,10 @@ function findSwings(
 
     if (isLow) {
 
-      swings.push({
-
+      lows.push({
         index: i,
-
-        price: c.low,
-
-        type: "low",
-
-        time: c.time
-
+        price: current.low,
+        time: current.time
       });
 
     }
@@ -1093,39 +1166,29 @@ function findSwings(
   }
 
 
-  return swings;
+  return {
+    highs,
+    lows
+  };
 
 }
 
 
-// ================================================================
-// TOP-DOWN BIAS
-// ================================================================
+/* =========================================================
+   STRUCTURE
+   ========================================================= */
 
-function getStructureBias(
+function getStructure(
   candles
 ) {
 
-  if (candles.length < 30) {
-
-    return "neutral";
-
-  }
-
-
-  const swings =
-    findSwings(candles);
-
-
-  const highs =
-    swings.filter(
-      s => s.type === "high"
-    );
-
-
-  const lows =
-    swings.filter(
-      s => s.type === "low"
+  const {
+    highs,
+    lows
+  } =
+    findSwings(
+      candles,
+      SWING_LOOKBACK
     );
 
 
@@ -1134,172 +1197,133 @@ function getStructureBias(
     lows.length < 2
   ) {
 
-    return "neutral";
+    return {
+      bias: "neutral",
+      highs,
+      lows
+    };
 
   }
 
 
-  const h1 =
-    highs[highs.length - 2];
-
-  const h2 =
+  const lastHigh =
     highs[highs.length - 1];
 
-  const l1 =
-    lows[lows.length - 2];
+  const prevHigh =
+    highs[highs.length - 2];
 
-  const l2 =
+  const lastLow =
     lows[lows.length - 1];
+
+  const prevLow =
+    lows[lows.length - 2];
 
 
   const bullish =
-    h2.price > h1.price &&
-    l2.price > l1.price;
+    lastHigh.price >
+      prevHigh.price &&
+    lastLow.price >
+      prevLow.price;
 
 
   const bearish =
-    h2.price < h1.price &&
-    l2.price < l1.price;
+    lastHigh.price <
+      prevHigh.price &&
+    lastLow.price <
+      prevLow.price;
 
 
-  if (bullish) {
+  return {
 
-    return "bullish";
+    bias:
+      bullish
+        ? "bullish"
+        : bearish
+          ? "bearish"
+          : "neutral",
 
-  }
+    highs,
+    lows,
 
+    lastHigh,
+    prevHigh,
 
-  if (bearish) {
+    lastLow,
+    prevLow
 
-    return "bearish";
-
-  }
-
-
-  return "neutral";
+  };
 
 }
 
 
-// ================================================================
-// FVG
-// ================================================================
+/* =========================================================
+   FVG
+   ========================================================= */
 
-function findFVGAt(
+function findRecentFVG(
   candles,
-  index,
-  direction
+  direction,
+  endIndex
 ) {
 
-  if (
-    index < 2 ||
-    index >= candles.length
-  ) {
-
-    return null;
-
-  }
-
-
-  const c1 =
-    candles[index - 2];
-
-  const c2 =
-    candles[index - 1];
-
-  const c3 =
-    candles[index];
-
-
-  /*
-   * We also require displacement.
-   */
-
-  const body =
-    Math.abs(
-      c2.close - c2.open
+  const start =
+    Math.max(
+      2,
+      endIndex - 8
     );
 
 
-  if (
-    body < MIN_DISPLACEMENT
+  for (
+    let i = endIndex;
+    i >= start;
+    i--
   ) {
 
-    return null;
+    const c1 =
+      candles[i - 2];
 
-  }
+    const c3 =
+      candles[i];
 
-
-  if (
-    direction === "bullish" &&
-    c1.high < c3.low
-  ) {
-
-    const bottom =
-      c1.high;
-
-    const top =
-      c3.low;
 
     if (
-      top - bottom <
-      MIN_FVG_SIZE
+      direction === "bullish" &&
+      c1.high < c3.low
     ) {
 
-      return null;
+      return {
+
+        top: c3.low,
+
+        bottom: c1.high,
+
+        index: i,
+
+        time: c3.time
+
+      };
 
     }
 
 
-    return {
-
-      top,
-
-      bottom,
-
-      index,
-
-      time:
-        c3.time
-
-    };
-
-  }
-
-
-  if (
-    direction === "bearish" &&
-    c1.low > c3.high
-  ) {
-
-    const bottom =
-      c3.high;
-
-    const top =
-      c1.low;
-
     if (
-      top - bottom <
-      MIN_FVG_SIZE
+      direction === "bearish" &&
+      c1.low > c3.high
     ) {
 
-      return null;
+      return {
+
+        top: c1.low,
+
+        bottom: c3.high,
+
+        index: i,
+
+        time: c3.time
+
+      };
 
     }
-
-
-    return {
-
-      top,
-
-      bottom,
-
-      index,
-
-      time:
-        c3.time
-
-    };
 
   }
 
@@ -1309,28 +1333,26 @@ function findFVGAt(
 }
 
 
-// ================================================================
-// ORDER BLOCK
-// ================================================================
+/* =========================================================
+   ORDER BLOCK
+   ========================================================= */
 
 function findOrderBlock(
   candles,
-  displacementIndex,
+  breakIndex,
   direction
 ) {
 
-  /*
-   * Search backward for the final opposite
-   * candle before the displacement.
-   */
+  const start =
+    Math.max(
+      0,
+      breakIndex - 8
+    );
+
 
   for (
-    let i =
-      displacementIndex - 1;
-
-    i >= 0 &&
-    i >= displacementIndex - 8;
-
+    let i = breakIndex - 1;
+    i >= start;
     i--
   ) {
 
@@ -1340,7 +1362,6 @@ function findOrderBlock(
 
     const bearish =
       c.close < c.open;
-
 
     const bullish =
       c.close > c.open;
@@ -1393,39 +1414,36 @@ function findOrderBlock(
 }
 
 
-// ================================================================
-// LIQUIDITY SWEEP DETECTION
-// ================================================================
+/* =========================================================
+   15M LIQUIDITY SWEEP
+   ========================================================= */
 
-function findLiquiditySweep(
-  candles,
+function detectLiquiditySweep(
+  candles15,
   direction
 ) {
 
-  const swings =
-    findSwings(candles);
+  if (
+    candles15.length < 10
+  ) {
+    return null;
+  }
 
 
-  const highs =
-    swings.filter(
-      s => s.type === "high"
-    );
+  const currentIndex =
+    candles15.length - 1;
+
+  const current =
+    candles15[currentIndex];
 
 
-  const lows =
-    swings.filter(
-      s => s.type === "low"
-    );
-
-
-  /*
-   * Look at recent completed candles.
-   */
-
-  const start =
-    Math.max(
-      SWING_LOOKBACK + 2,
-      candles.length - 15
+  const {
+    highs,
+    lows
+  } =
+    findSwings(
+      candles15,
+      SWING_LOOKBACK
     );
 
 
@@ -1433,61 +1451,56 @@ function findLiquiditySweep(
     direction === "bullish"
   ) {
 
-    for (
-      let i =
-        candles.length - 1;
+    const previousLows =
+      lows.filter(
+        s =>
+          s.index <
+          currentIndex
+      );
 
-      i >= start;
 
-      i--
+    if (
+      previousLows.length === 0
+    ) {
+      return null;
+    }
+
+
+    const liquidity =
+      previousLows[
+        previousLows.length - 1
+      ];
+
+
+    const swept =
+      current.low <
+      liquidity.price;
+
+
+    const reclaimed =
+      current.close >
+      liquidity.price;
+
+
+    if (
+      swept &&
+      reclaimed
     ) {
 
-      const c =
-        candles[i];
+      return {
 
+        type: "bullish",
 
-      const previousLows =
-        lows.filter(
-          s => s.index < i
-        );
+        level:
+          liquidity.price,
 
+        candleIndex:
+          currentIndex,
 
-      if (!previousLows.length) {
+        time:
+          current.time
 
-        continue;
-
-      }
-
-
-      const target =
-        previousLows[
-          previousLows.length - 1
-        ];
-
-
-      /*
-       * Price takes sell-side liquidity
-       * then closes back above it.
-       */
-
-      if (
-        c.low < target.price &&
-        c.close > target.price
-      ) {
-
-        return {
-
-          index: i,
-
-          level:
-            target.price,
-
-          time:
-            c.time
-
-        };
-
-      }
+      };
 
     }
 
@@ -1498,363 +1511,54 @@ function findLiquiditySweep(
     direction === "bearish"
   ) {
 
-    for (
-      let i =
-        candles.length - 1;
-
-      i >= start;
-
-      i--
-    ) {
-
-      const c =
-        candles[i];
-
-
-      const previousHighs =
-        highs.filter(
-          s => s.index < i
-        );
-
-
-      if (!previousHighs.length) {
-
-        continue;
-
-      }
-
-
-      const target =
-        previousHighs[
-          previousHighs.length - 1
-        ];
-
-
-      /*
-       * Price takes buy-side liquidity
-       * then closes back below it.
-       */
-
-      if (
-        c.high > target.price &&
-        c.close < target.price
-      ) {
-
-        return {
-
-          index: i,
-
-          level:
-            target.price,
-
-          time:
-            c.time
-
-        };
-
-      }
-
-    }
-
-  }
-
-
-  return null;
-
-}
-
-
-// ================================================================
-// FIND 15M DISPLACEMENT / BOS AFTER SWEEP
-// ================================================================
-
-function findDisplacementAfterSweep(
-  candles,
-  sweep,
-  direction
-) {
-
-  const maxBars =
-    Math.min(
-      candles.length - 1,
-      sweep.index + 6
-    );
-
-
-  for (
-    let i =
-      sweep.index + 1;
-
-    i <= maxBars;
-
-    i++
-  ) {
-
-    const c =
-      candles[i];
-
-
-    const body =
-      Math.abs(
-        c.close - c.open
+    const previousHighs =
+      highs.filter(
+        s =>
+          s.index <
+          currentIndex
       );
 
 
     if (
-      body < MIN_DISPLACEMENT
+      previousHighs.length === 0
     ) {
-
-      continue;
-
+      return null;
     }
+
+
+    const liquidity =
+      previousHighs[
+        previousHighs.length - 1
+      ];
+
+
+    const swept =
+      current.high >
+      liquidity.price;
+
+
+    const rejected =
+      current.close <
+      liquidity.price;
 
 
     if (
-      direction === "bullish" &&
-      c.close <= c.open
+      swept &&
+      rejected
     ) {
 
-      /*
-       * Find the nearest recent swing high
-       * before the displacement.
-       */
+      return {
 
-      const swings =
-        findSwings(
-          candles.slice(
-            0,
-            i
-          )
-        );
+        type: "bearish",
 
+        level:
+          liquidity.price,
 
-      const highs =
-        swings.filter(
-          s => s.type === "high"
-        );
-
-
-      if (!highs.length) {
-
-        continue;
-
-      }
-
-
-      const lastHigh =
-        highs[highs.length - 1];
-
-
-      if (
-        c.close >
-        lastHigh.price
-      ) {
-
-        return {
-
-          index: i,
-
-          level:
-            lastHigh.price,
-
-          time:
-            c.time
-
-        };
-
-      }
-
-    }
-
-
-    if (
-      direction === "bearish" &&
-      c.close >= c.open
-    ) {
-
-      const swings =
-        findSwings(
-          candles.slice(
-            0,
-            i
-          )
-        );
-
-
-      const lows =
-        swings.filter(
-          s => s.type === "low"
-        );
-
-
-      if (!lows.length) {
-
-        continue;
-
-      }
-
-
-      const lastLow =
-        lows[lows.length - 1];
-
-
-      if (
-        c.close <
-        lastLow.price
-      ) {
-
-        return {
-
-          index: i,
-
-          level:
-            lastLow.price,
-
-          time:
-            c.time
-
-        };
-
-      }
-
-    }
-
-  }
-
-
-  return null;
-
-}
-
-
-// ================================================================
-// BUILD 15M SETUP
-// ================================================================
-
-function build15mSetup(
-  candles,
-  direction
-) {
-
-  const sweep =
-    findLiquiditySweep(
-      candles,
-      direction
-    );
-
-
-  if (!sweep) {
-
-    return null;
-
-  }
-
-
-  const displacement =
-    findDisplacementAfterSweep(
-      candles,
-      sweep,
-      direction
-    );
-
-
-  if (!displacement) {
-
-    return null;
-
-  }
-
-
-  /*
-   * Search the candles around the displacement
-   * for the FVG created by the move.
-   */
-
-  let fvg = null;
-
-
-  for (
-    let i =
-      displacement.index;
-
-    i >= Math.max(
-      2,
-      displacement.index - 3
-    );
-
-    i--
-  ) {
-
-    const candidate =
-      findFVGAt(
-        candles,
-        i,
-        direction
-      );
-
-
-    if (candidate) {
-
-      fvg = candidate;
-
-      break;
-
-    }
-
-  }
-
-
-  if (!fvg) {
-
-    return null;
-
-  }
-
-
-  const orderBlock =
-    findOrderBlock(
-      candles,
-      displacement.index,
-      direction
-    );
-
-
-  /*
-   * Prefer the order block if it overlaps
-   * the FVG. Otherwise use the FVG.
-   */
-
-  let zone = fvg;
-
-
-  if (orderBlock) {
-
-    const overlaps =
-      orderBlock.bottom <= fvg.top &&
-      orderBlock.top >= fvg.bottom;
-
-
-    if (overlaps) {
-
-      zone = {
-
-        top:
-          Math.min(
-            orderBlock.top,
-            fvg.top
-          ),
-
-        bottom:
-          Math.max(
-            orderBlock.bottom,
-            fvg.bottom
-          ),
-
-        index:
-          fvg.index,
+        candleIndex:
+          currentIndex,
 
         time:
-          fvg.time
+          current.time
 
       };
 
@@ -1863,170 +1567,100 @@ function build15mSetup(
   }
 
 
-  return {
-
-    direction,
-
-    label:
-      direction === "bullish"
-        ? "LIQUIDITY + BOS"
-        : "LIQUIDITY + BOS",
-
-    sweep,
-
-    displacement,
-
-    fvg,
-
-    orderBlock,
-
-    zone,
-
-    createdAt:
-      Date.now(),
-
-    createdCandleTime:
-      candles[
-        displacement.index
-      ].time
-
-  };
+  return null;
 
 }
 
 
-// ================================================================
-// 5M ENTRY CONFIRMATION
-// ================================================================
+/* =========================================================
+   15M BOS AFTER LIQUIDITY SWEEP
+   ========================================================= */
 
-function find5mConfirmation(
-  candles,
-  setup
+function findBOSAfterSweep(
+  candles15,
+  sweep,
+  direction
 ) {
 
-  if (!candles.length) {
+  const start =
+    sweep.candleIndex + 1;
+
+
+  if (
+    start >= candles15.length
+  ) {
+    return null;
+  }
+
+
+  const structure =
+    getStructure(
+      candles15
+    );
+
+
+  if (
+    !structure.lastHigh ||
+    !structure.lastLow
+  ) {
 
     return null;
 
   }
 
 
-  const zone =
-    setup.zone;
+  const reference =
+    direction === "bullish"
+      ? structure.lastHigh.price
+      : structure.lastLow.price;
 
 
   for (
-    let i =
-      candles.length - 1;
-
-    i >= 0;
-
-    i--
+    let i = start;
+    i < candles15.length;
+    i++
   ) {
 
     const c =
-      candles[i];
+      candles15[i];
 
-
-    /*
-     * Do not use candles that existed before
-     * the 15M setup was created.
-     */
 
     if (
-      c.time <=
-      setup.createdCandleTime
+      direction === "bullish" &&
+      c.close > reference
     ) {
 
-      continue;
+      return {
+
+        direction,
+
+        index: i,
+
+        level: reference,
+
+        time: c.time
+
+      };
 
     }
 
 
-    /*
-     * Zone interaction.
-     */
-
-    const touched =
-      c.low <= zone.top &&
-      c.high >= zone.bottom;
-
-
-    if (!touched) {
-
-      continue;
-
-    }
-
-
-    /*
-     * Bullish rejection:
-     * candle trades into zone but closes
-     * above the zone.
-     */
-
     if (
-      setup.direction === "bullish"
+      direction === "bearish" &&
+      c.close < reference
     ) {
 
-      const bullish =
-        c.close > c.open;
+      return {
 
+        direction,
 
-      const rejection =
-        c.close > zone.top;
+        index: i,
 
+        level: reference,
 
-      if (
-        bullish &&
-        rejection
-      ) {
+        time: c.time
 
-        return {
-
-          candle: c,
-
-          entry:
-            c.close
-
-        };
-
-      }
-
-    }
-
-
-    /*
-     * Bearish rejection.
-     */
-
-    if (
-      setup.direction === "bearish"
-    ) {
-
-      const bearish =
-        c.close < c.open;
-
-
-      const rejection =
-        c.close < zone.bottom;
-
-
-      if (
-        bearish &&
-        rejection
-      ) {
-
-        return {
-
-          candle: c,
-
-          entry:
-            c.close
-
-        };
-
-      }
+      };
 
     }
 
@@ -2038,226 +1672,312 @@ function find5mConfirmation(
 }
 
 
-// ================================================================
-// STRUCTURE STOP / TARGET
-// ================================================================
+/* =========================================================
+   BUILD PENDING SETUP
+   ========================================================= */
 
-function calculateTradeLevels(
-  setup,
-  entry
+function buildSetup(
+  candles15,
+  candles1h,
+  candles4h
 ) {
 
-  let stopLoss;
+  if (pendingSetup) {
 
-  let takeProfit;
+    if (
+      Date.now() -
+        pendingSetup.createdAt >
+      SETUP_EXPIRY_MS
+    ) {
+
+      console.log(
+        "[SETUP] Expired."
+      );
+
+      pendingSetup = null;
+
+    } else {
+
+      return;
+
+    }
+
+  }
+
+
+  const structure4h =
+    getStructure(
+      candles4h
+    );
+
+
+  const structure1h =
+    getStructure(
+      candles1h
+    );
+
+
+  /*
+   4H = directional bias
+   1H = confirmation
+  */
+
+  if (
+    structure4h.bias === "neutral" ||
+    structure1h.bias === "neutral"
+  ) {
+
+    return;
+
+  }
 
 
   if (
-    setup.direction === "bullish"
+    structure4h.bias !==
+    structure1h.bias
   ) {
 
-    /*
-     * Stop below the liquidity sweep.
-     */
+    return;
 
-    stopLoss =
-      setup.sweep.level - 1.0;
+  }
 
 
-    /*
-     * Target is based on the next meaningful
-     * 15M swing high rather than a fixed $25.
-     */
-
-    const candles =
-      cachedMarket.setup;
+  const direction =
+    structure4h.bias;
 
 
-    const swings =
-      findSwings(candles);
+  /*
+   15M liquidity sweep
+  */
+
+  const sweep =
+    detectLiquiditySweep(
+      candles15,
+      direction
+    );
 
 
-    const highs =
-      swings.filter(
-        s =>
-          s.type === "high" &&
-          s.price > entry
-      );
+  if (!sweep) {
 
-
-    if (highs.length) {
-
-      takeProfit =
-        highs[
-          highs.length - 1
-        ].price;
-
-    } else {
-
-      takeProfit =
-        entry + 25;
-
-    }
-
-  } else {
-
-    stopLoss =
-      setup.sweep.level + 1.0;
-
-
-    const candles =
-      cachedMarket.setup;
-
-
-    const swings =
-      findSwings(candles);
-
-
-    const lows =
-      swings.filter(
-        s =>
-          s.type === "low" &&
-          s.price < entry
-      );
-
-
-    if (lows.length) {
-
-      takeProfit =
-        lows[
-          lows.length - 1
-        ].price;
-
-    } else {
-
-      takeProfit =
-        entry - 25;
-
-    }
+    return;
 
   }
 
 
   /*
-   * Safety checks.
-   */
+   15M BOS after sweep
+  */
 
-  if (
-    setup.direction === "bullish" &&
-    takeProfit <= entry
-  ) {
-
-    takeProfit =
-      entry + 25;
-
-  }
+  const bos =
+    findBOSAfterSweep(
+      candles15,
+      sweep,
+      direction
+    );
 
 
-  if (
-    setup.direction === "bearish" &&
-    takeProfit >= entry
-  ) {
+  if (!bos) {
 
-    takeProfit =
-      entry - 25;
+    return;
 
   }
 
 
-  return {
+  /*
+   15M FVG
+  */
 
-    stopLoss,
+  const fvg =
+    findRecentFVG(
+      candles15,
+      direction,
+      bos.index
+    );
 
-    takeProfit
+
+  if (!fvg) {
+
+    return;
+
+  }
+
+
+  /*
+   15M Order Block
+  */
+
+  const orderBlock =
+    findOrderBlock(
+      candles15,
+      bos.index,
+      direction
+    );
+
+
+  /*
+   Prefer OB when available.
+   Otherwise use FVG.
+  */
+
+  const zoneTop =
+    orderBlock
+      ? orderBlock.top
+      : fvg.top;
+
+  const zoneBottom =
+    orderBlock
+      ? orderBlock.bottom
+      : fvg.bottom;
+
+
+  const structure =
+    getStructure(
+      candles15
+    );
+
+
+  pendingSetup = {
+
+    direction,
+
+    label:
+      structure4h.bias ===
+        structure1h.bias
+        ? "BOS"
+        : "CHoCH",
+
+    createdAt:
+      Date.now(),
+
+    liquiditySweep:
+      sweep,
+
+    bos,
+
+    fvg,
+
+    orderBlock,
+
+    entryZoneTop:
+      zoneTop,
+
+    entryZoneBottom:
+      zoneBottom,
+
+    structureLow:
+      structure.lastLow
+        ? structure.lastLow.price
+        : null,
+
+    structureHigh:
+      structure.lastHigh
+        ? structure.lastHigh.price
+        : null
 
   };
 
-}
 
-
-// ================================================================
-// RISK / REWARD CHECK
-// ================================================================
-
-function validRiskReward(
-  direction,
-  entry,
-  stopLoss,
-  takeProfit
-) {
-
-  const risk =
-    Math.abs(
-      entry - stopLoss
-    );
-
-
-  const reward =
-    Math.abs(
-      takeProfit - entry
-    );
-
-
-  if (
-    risk <= 0 ||
-    reward <= 0
-  ) {
-
-    return false;
-
-  }
-
-
-  const rr =
-    reward / risk;
-
-
-  /*
-   * Require at least 1.5R.
-   */
-
-  return rr >= 1.5;
-
-}
-
-
-// ================================================================
-// OPEN SIGNAL
-// ================================================================
-
-function hasOpenSignal() {
-
-  return signalHistory.some(
-    s => s.status === "open"
+  console.log(
+    `[SETUP] ${direction.toUpperCase()} ${pendingSetup.label} | 4H=${structure4h.bias} | 1H=${structure1h.bias} | 15M liquidity+BOS+FVG+OB`
   );
 
 }
 
 
-// ================================================================
-// FIRE SIGNAL
-// ================================================================
+/* =========================================================
+   5M ENTRY CONFIRMATION
+   ========================================================= */
 
-function fireSignal(
-  setup,
-  entry
-) {
+function check5mEntry() {
 
-  if (hasOpenSignal()) {
-
+  if (!pendingSetup) {
     return;
+  }
 
+
+  const c =
+    candles5m[
+      candles5m.length - 1
+    ];
+
+
+  if (!c) {
+    return;
   }
 
 
   if (
     Date.now() -
-    lastSignalTime <
-    SIGNAL_COOLDOWN_MS
+      pendingSetup.createdAt >
+    SETUP_EXPIRY_MS
+  ) {
+
+    pendingSetup = null;
+
+    return;
+
+  }
+
+
+  const insideZone =
+    c.low <=
+      pendingSetup.entryZoneTop &&
+    c.high >=
+      pendingSetup.entryZoneBottom;
+
+
+  if (!insideZone) {
+
+    return;
+
+  }
+
+
+  const bullishConfirmation =
+    pendingSetup.direction ===
+      "bullish" &&
+    c.close > c.open;
+
+
+  const bearishConfirmation =
+    pendingSetup.direction ===
+      "bearish" &&
+    c.close < c.open;
+
+
+  if (
+    !bullishConfirmation &&
+    !bearishConfirmation
+  ) {
+
+    return;
+
+  }
+
+
+  fireSignal(
+    pendingSetup,
+    c.close
+  );
+
+
+  pendingSetup = null;
+
+}
+
+
+/* =========================================================
+   MAIN TOP-DOWN ENGINE
+   ========================================================= */
+
+function runStrategy() {
+
+  if (
+    candles5m.length < 100
   ) {
 
     console.log(
-      "[SIGNAL] Cooldown active"
+      `[STRATEGY] Building history: ${candles5m.length}/100`
     );
 
     return;
@@ -2265,33 +1985,151 @@ function fireSignal(
   }
 
 
-  const levels =
-    calculateTradeLevels(
-      setup,
-      entry
+  if (
+    hasOpenSignal()
+  ) {
+
+    return;
+
+  }
+
+
+  const candles15 =
+    aggregateCandles(
+      candles5m,
+      15
     );
 
 
-  const stopLoss =
-    levels.stopLoss;
+  const candles1h =
+    aggregateCandles(
+      candles5m,
+      60
+    );
 
 
-  const takeProfit =
-    levels.takeProfit;
+  const candles4h =
+    aggregateCandles(
+      candles5m,
+      240
+    );
 
 
   if (
-    !validRiskReward(
-      setup.direction,
-      entry,
-      stopLoss,
-      takeProfit
-    )
+    candles15.length < 30 ||
+    candles1h.length < 20 ||
+    candles4h.length < 10
+  ) {
+
+    return;
+
+  }
+
+
+  /*
+   4H:
+   overall direction
+  */
+
+  const structure4h =
+    getStructure(
+      candles4h
+    );
+
+
+  /*
+   1H:
+   confirmation
+  */
+
+  const structure1h =
+    getStructure(
+      candles1h
+    );
+
+
+  console.log(
+    `[TOP-DOWN] 4H=${structure4h.bias} | 1H=${structure1h.bias}`
+  );
+
+
+  /*
+   Only continue when both agree.
+  */
+
+  if (
+    structure4h.bias === "neutral" ||
+    structure1h.bias === "neutral" ||
+    structure4h.bias !==
+      structure1h.bias
+  ) {
+
+    return;
+
+  }
+
+
+  /*
+   15M liquidity + BOS + FVG + OB
+  */
+
+  buildSetup(
+    candles15,
+    candles1h,
+    candles4h
+  );
+
+
+  /*
+   5M entry
+  */
+
+  check5mEntry();
+
+}
+
+
+/* =========================================================
+   OPEN SIGNAL
+   ========================================================= */
+
+function hasOpenSignal() {
+
+  return signalHistory.some(
+    s =>
+      s.status === "open"
+  );
+
+}
+
+
+/* =========================================================
+   FIRE SIGNAL
+   ========================================================= */
+
+async function fireSignal(
+  setup,
+  entryPrice
+) {
+
+  if (
+    Date.now() -
+      lastSignalTime <
+    SIGNAL_COOLDOWN_MS
   ) {
 
     console.log(
-      "[SIGNAL] Rejected - R:R below 1.5"
+      "[SIGNAL] Cooldown active."
     );
+
+    return;
+
+  }
+
+
+  if (
+    hasOpenSignal()
+  ) {
 
     return;
 
@@ -2310,86 +2148,102 @@ function fireSignal(
       : "🔴";
 
 
-  const risk =
-    Math.abs(
-      entry - stopLoss
+  let stopLoss;
+  let takeProfit;
+
+
+  if (
+    setup.direction ===
+    "bullish"
+  ) {
+
+    stopLoss =
+      (
+        setup.orderBlock
+          ? setup.orderBlock.bottom
+          : setup.structureLow
+      ) - SL_BUFFER;
+
+    takeProfit =
+      entryPrice +
+      TP_DISTANCE;
+
+  } else {
+
+    stopLoss =
+      (
+        setup.orderBlock
+          ? setup.orderBlock.top
+          : setup.structureHigh
+      ) + SL_BUFFER;
+
+    takeProfit =
+      entryPrice -
+      TP_DISTANCE;
+
+  }
+
+
+  /*
+   Safety validation.
+  */
+
+  if (
+    !Number.isFinite(stopLoss) ||
+    !Number.isFinite(takeProfit)
+  ) {
+
+    console.error(
+      "[SIGNAL] Invalid SL/TP."
     );
 
+    return;
 
-  const reward =
-    Math.abs(
-      takeProfit - entry
+  }
+
+
+  if (
+    direction === "BUY" &&
+    stopLoss >= entryPrice
+  ) {
+
+    console.log(
+      "[SIGNAL] Invalid BUY stop."
     );
 
+    return;
 
-  const rr =
-    reward / risk;
-
-
-  lastSignalTime =
-    Date.now();
+  }
 
 
-  const message =
-`🚨 XAUUSD TOP-DOWN SIGNAL
+  if (
+    direction === "SELL" &&
+    stopLoss <= entryPrice
+  ) {
 
-${emoji} ${direction}
+    console.log(
+      "[SIGNAL] Invalid SELL stop."
+    );
 
-💰 Entry: ${entry.toFixed(2)}
+    return;
 
-🛡️ Stop Loss:
-${stopLoss.toFixed(2)}
-
-🎯 Take Profit:
-${takeProfit.toFixed(2)}
-
-📊 Risk/Reward:
-1:${rr.toFixed(2)}
-
-━━━━━━━━━━━━━━
-
-🔎 TOP-DOWN CONFIRMATION
-
-4H:
-${setup.htfBias.toUpperCase()} bias
-
-1H:
-${setup.midBias.toUpperCase()} confirmation
-
-15M:
-💧 Liquidity sweep
-📈 Displacement
-📊 BOS
-🟨 FVG
-🟦 Order Block
-
-5M:
-✅ Retest
-✅ Rejection candle
-
-━━━━━━━━━━━━━━
-
-⚠️ Risk management is your responsibility.
-This is not financial advice.`;
+  }
 
 
   const signal = {
 
     id:
-      `${Date.now()}-${Math.floor(
-        Math.random() * 1000
-      )}`,
+      `${Date.now()}-${Math.floor(Math.random() * 10000)}`,
 
     time:
       Date.now(),
 
     label:
-      "TOP-DOWN SMC",
+      setup.label,
 
     direction,
 
-    entryPrice:
-      entry,
+    entryPrice,
 
     stopLoss,
 
@@ -2422,396 +2276,106 @@ This is not financial advice.`;
   }
 
 
+  lastSignalTime =
+    Date.now();
+
+
+  const message =
+
+`🚨 XAUUSD TOP-DOWN SIGNAL
+
+${emoji} ${direction}
+Entry: ${entryPrice.toFixed(2)}
+
+🛡️ SL: ${stopLoss.toFixed(2)}
+🎯 TP: ${takeProfit.toFixed(2)}
+
+📊 TOP-DOWN CONFIRMATION
+
+4H → Overall bias
+1H → Trend confirmation
+15M → Liquidity sweep
+15M → BOS
+15M → FVG
+15M → Order Block
+5M → Entry confirmation
+
+📏 Target:
+${TP_PIPS_MIN}-${TP_PIPS_MAX} pips
+
+⚠️ Risk management is your responsibility.`;
+
+
   console.log(
-    `[SIGNAL FIRED] ${direction} @ ${entry.toFixed(2)}`
+    `[SIGNAL FIRED] ${direction} @ ${entryPrice.toFixed(2)} | SL ${stopLoss.toFixed(2)} | TP ${takeProfit.toFixed(2)}`
   );
 
+
+  await broadcast(
+    message
+  );
+
+}
+
+
+/* =========================================================
+   BROADCAST
+   ========================================================= */
+
+async function broadcast(
+  message
+) {
 
   for (
     const chatId of subscribers.keys()
   ) {
 
-    bot.sendMessage(
-      chatId,
-      message
-    ).catch(err => {
+    try {
+
+      await bot.sendMessage(
+        chatId,
+        message
+      );
+
+    } catch (error) {
 
       console.error(
-        `Failed to send signal to ${chatId}:`,
-        err.message
+        `Telegram send failed for ${chatId}:`,
+        error.message
       );
 
-    });
+    }
 
   }
 
 }
 
 
-// ================================================================
-// MARKET ANALYSIS
-// ================================================================
-
-async function analyzeMarket() {
-
-  try {
-
-    /*
-     * Never create another trade while one is open.
-     */
-
-    if (hasOpenSignal()) {
-
-      return;
-
-    }
-
-
-    /*
-     * Prevent repeated analysis within the same minute.
-     */
-
-    if (
-      Date.now() -
-      lastAnalysisTime <
-      DATA_REFRESH_MS
-    ) {
-
-      return;
-
-    }
-
-
-    lastAnalysisTime =
-      Date.now();
-
-
-    console.log(
-      "[ANALYSIS] Fetching multi-timeframe data..."
-    );
-
-
-    const [
-      htf,
-      mid,
-      setupCandles,
-      entryCandles
-    ] =
-      await Promise.all([
-
-        getTimeSeries(
-          TIMEFRAMES.HTF,
-          HTF_CANDLES
-        ),
-
-        getTimeSeries(
-          TIMEFRAMES.MID,
-          MID_CANDLES
-        ),
-
-        getTimeSeries(
-          TIMEFRAMES.SETUP,
-          SETUP_CANDLES
-        ),
-
-        getTimeSeries(
-          TIMEFRAMES.ENTRY,
-          ENTRY_CANDLES
-        )
-
-      ]);
-
-
-    cachedMarket.htf =
-      htf;
-
-    cachedMarket.mid =
-      mid;
-
-    cachedMarket.setup =
-      setupCandles;
-
-    cachedMarket.entry =
-      entryCandles;
-
-    cachedMarket.updatedAt =
-      Date.now();
-
-
-    if (
-      htf.length < 40 ||
-      mid.length < 40 ||
-      setupCandles.length < 50 ||
-      entryCandles.length < 50
-    ) {
-
-      console.log(
-        "[ANALYSIS] Not enough candle history."
-      );
-
-      return;
-
-    }
-
-
-    const htfBias =
-      getStructureBias(
-        htf
-      );
-
-
-    const midBias =
-      getStructureBias(
-        mid
-      );
-
-
-    console.log(
-      `[BIAS] 4H=${htfBias} | 1H=${midBias}`
-    );
-
-
-    /*
-     * TOP-DOWN FILTER
-     *
-     * Both higher timeframes must agree.
-     */
-
-    if (
-      htfBias === "neutral" ||
-      midBias === "neutral"
-    ) {
-
-      pendingSetup = null;
-
-      console.log(
-        "[ANALYSIS] No clear higher-timeframe bias."
-      );
-
-      return;
-
-    }
-
-
-    if (
-      htfBias !== midBias
-    ) {
-
-      pendingSetup = null;
-
-      console.log(
-        "[ANALYSIS] 4H and 1H disagree. No trade."
-      );
-
-      return;
-
-    }
-
-
-    const direction =
-      htfBias;
-
-
-    /*
-     * If an existing setup has expired,
-     * remove it.
-     */
-
-    if (pendingSetup) {
-
-      if (
-        Date.now() -
-        pendingSetup.createdAt >
-        SETUP_EXPIRY_MS
-      ) {
-
-        console.log(
-          "[SETUP] Expired."
-        );
-
-        pendingSetup =
-          null;
-
-      }
-
-    }
-
-
-    /*
-     * If no setup exists, search 15M.
-     */
-
-    if (!pendingSetup) {
-
-      const setup =
-        build15mSetup(
-          setupCandles,
-          direction
-        );
-
-
-      if (setup) {
-
-        setup.htfBias =
-          htfBias;
-
-        setup.midBias =
-          midBias;
-
-
-        pendingSetup =
-          setup;
-
-
-        console.log(
-          `[SETUP] ${direction.toUpperCase()} liquidity sweep + BOS + FVG found.`
-        );
-
-      }
-
-    }
-
-
-    if (!pendingSetup) {
-
-      console.log(
-        "[ANALYSIS] No valid 15M setup."
-      );
-
-      return;
-
-    }
-
-
-    /*
-     * Make sure the pending setup still agrees
-     * with the higher timeframes.
-     */
-
-    if (
-      pendingSetup.direction !==
-      direction
-    ) {
-
-      pendingSetup =
-        null;
-
-      return;
-
-    }
-
-
-    /*
-     * Check 5M retest.
-     */
-
-    const confirmation =
-      find5mConfirmation(
-        entryCandles,
-        pendingSetup
-      );
-
-
-    if (!confirmation) {
-
-      console.log(
-        "[ANALYSIS] Waiting for 5M retest."
-      );
-
-      return;
-
-    }
-
-
-    const entry =
-      confirmation.entry;
-
-
-    /*
-     * Prevent entries that occur far away
-     * from the intended zone.
-     */
-
-    const zone =
-      pendingSetup.zone;
-
-
-    const distance =
-      pendingSetup.direction === "bullish"
-
-        ? Math.max(
-            0,
-            entry - zone.top
-          )
-
-        : Math.max(
-            0,
-            zone.bottom - entry
-          );
-
-
-    if (
-      distance >
-      MAX_ENTRY_DISTANCE
-    ) {
-
-      console.log(
-        "[SETUP] Price moved too far from zone."
-      );
-
-      pendingSetup =
-        null;
-
-      return;
-
-    }
-
-
-    fireSignal(
-      pendingSetup,
-      entry
-    );
-
-
-    /*
-     * Whether signal fired or was rejected,
-     * don't repeatedly process the exact setup.
-     */
-
-    pendingSetup =
-      null;
-
-  } catch (error) {
-
-    console.error(
-      "[ANALYSIS ERROR]",
-      error.response?.data ||
-      error.message
-    );
-
-  }
-
-}
-
-
-// ================================================================
-// OPEN SIGNAL TRACKER
-// ================================================================
-
-function checkOpenSignals(
-  currentPrice
-) {
-
-  if (!currentPrice) {
+/* =========================================================
+   OPEN SIGNAL TRACKER
+   ========================================================= */
+
+function updateOpenSignalsFromLatestCandle() {
+
+  if (
+    candles5m.length === 0
+  ) {
 
     return;
 
   }
 
 
+  const candle =
+    candles5m[
+      candles5m.length - 1
+    ];
+
+
   const openSignals =
     signalHistory.filter(
-      s => s.status === "open"
+      s =>
+        s.status === "open"
     );
 
 
@@ -2819,428 +2383,339 @@ function checkOpenSignals(
     const signal of openSignals
   ) {
 
-    let hitTP =
-      false;
-
-    let hitSL =
-      false;
+    let hitSL = false;
+    let hitTP = false;
 
 
     if (
-      signal.direction === "BUY"
+      signal.direction ===
+      "BUY"
     ) {
 
-      hitTP =
-        currentPrice >=
-        signal.takeProfit;
-
       hitSL =
-        currentPrice <=
+        candle.low <=
         signal.stopLoss;
+
+      hitTP =
+        candle.high >=
+        signal.takeProfit;
 
     } else {
 
-      hitTP =
-        currentPrice <=
-        signal.takeProfit;
-
       hitSL =
-        currentPrice >=
+        candle.high >=
         signal.stopLoss;
+
+      hitTP =
+        candle.low <=
+        signal.takeProfit;
 
     }
 
 
     /*
-     * Conservative rule if both are crossed
-     * between checks.
-     */
+     If the same candle touches both,
+     conservatively count SL first.
+    */
 
     if (hitSL) {
 
-      signal.status =
-        "loss";
-
-    } else if (hitTP) {
-
-      signal.status =
-        "win";
-
-    } else {
+      closeSignal(
+        signal,
+        "loss",
+        signal.stopLoss
+      );
 
       continue;
 
     }
 
 
-    signal.closedAt =
-      Date.now();
+    if (hitTP) {
 
-    signal.closePrice =
-      currentPrice;
-
-
-    lastSignalTime =
-      Date.now();
-
-
-    const win =
-      signal.status === "win";
-
-
-    const resultEmoji =
-      win ? "✅" : "❌";
-
-
-    const resultText =
-      win
-        ? "TAKE PROFIT HIT"
-        : "STOP LOSS HIT";
-
-
-    const closeMessage =
-`${resultEmoji} XAUUSD SIGNAL CLOSED
-
-${resultText}
-
-${signal.direction} @ ${signal.entryPrice.toFixed(2)}
-
-Closed @ ${currentPrice.toFixed(2)}
-
-${win
-  ? "🎯 Target reached."
-  : "🛡️ Stop loss reached."}`;
-
-
-    console.log(
-      `[RESULT] ${signal.direction} -> ${signal.status.toUpperCase()}`
-    );
-
-
-    for (
-      const chatId of subscribers.keys()
-    ) {
-
-      bot.sendMessage(
-        chatId,
-        closeMessage
-      ).catch(err => {
-
-        console.error(
-          `Failed result message to ${chatId}:`,
-          err.message
-        );
-
-      });
-
-    }
-
-  }
-
-}
-
-
-// ================================================================
-// MARKET MONITOR
-// ================================================================
-
-async function monitorMarket() {
-
-  try {
-
-    /*
-     * Get latest completed 5M candle.
-     */
-
-    const candles =
-      await getTimeSeries(
-        "5min",
-        3
+      closeSignal(
+        signal,
+        "win",
+        signal.takeProfit
       );
 
-
-    if (!candles.length) {
-
-      return;
+      continue;
 
     }
 
 
-    const price =
-      candles[
-        candles.length - 1
-      ].close;
-
-
-    cachedMarket.price =
-      price;
-
-
-    console.log(
-      `[MARKET] XAUUSD ${price.toFixed(2)}`
-    );
-
-
-    checkOpenSignals(
-      price
-    );
-
-
     /*
-     * Full top-down analysis.
-     */
+     Maximum holding period.
+    */
 
-    await analyzeMarket();
+    if (
+      Date.now() -
+        signal.time >
+      SIGNAL_MAX_HOLD_MS
+    ) {
 
-  } catch (error) {
+      signal.status =
+        "expired";
 
-    console.error(
-      "[MARKET ERROR]",
-      error.response?.data ||
-      error.message
-    );
+      signal.closedAt =
+        Date.now();
+
+      signal.closePrice =
+        candle.close;
+
+
+      console.log(
+        `[SIGNAL EXPIRED] ${signal.direction}`
+      );
+
+    }
 
   }
 
 }
 
 
-// ================================================================
-// START COMMAND
-// ================================================================
+/* =========================================================
+   CLOSE SIGNAL
+   ========================================================= */
+
+async function closeSignal(
+  signal,
+  result,
+  closePrice
+) {
+
+  signal.status =
+    result;
+
+  signal.closedAt =
+    Date.now();
+
+  signal.closePrice =
+    closePrice;
+
+
+  lastSignalTime =
+    Date.now();
+
+
+  const message =
+
+result === "win"
+
+? `
+
+✅ XAUUSD SIGNAL CLOSED
+
+🎯 TAKE PROFIT HIT
+
+${signal.direction}
+Entry: ${signal.entryPrice.toFixed(2)}
+Closed: ${closePrice.toFixed(2)}
+
+`
+
+: `
+
+❌ XAUUSD SIGNAL CLOSED
+
+🛡️ STOP LOSS HIT
+
+${signal.direction}
+Entry: ${signal.entryPrice.toFixed(2)}
+Closed: ${closePrice.toFixed(2)}
+
+`;
+
+
+  console.log(
+    `[SIGNAL CLOSED] ${signal.direction} -> ${result.toUpperCase()} @ ${closePrice.toFixed(2)}`
+  );
+
+
+  await broadcast(
+    message
+  );
+
+}
+
+
+/* =========================================================
+   /START
+   ========================================================= */
 
 bot.onText(
   /\/start/,
   async msg => {
 
     await bot.sendMessage(
-
       msg.chat.id,
 
 `🔥 MONEY MAKING MACHINE BOT
 
-Welcome! 👋
+Welcome 👋
 
-Your XAUUSD top-down
-SMC trading assistant.
+This version uses:
 
-📊 4H + 1H bias
-💧 15M liquidity sweep
-📈 15M BOS/displacement
-🟨 FVG
-🟦 Order Block
-✅ 5M confirmation
+4H → Overall bias
+1H → Confirmation
+15M → Liquidity + BOS
+15M → FVG + OB
+5M → Entry confirmation
 
-Choose an option below:`,
+The bot waits for the complete top-down setup instead of trading every small 5M breakout.`,
 
       mainMenu
-
     );
 
   }
 );
 
 
-// ================================================================
-// TELEGRAM MENU
-// ================================================================
+/* =========================================================
+   MESSAGE HANDLER
+   ========================================================= */
 
 bot.on(
   "message",
   async msg => {
 
     if (!msg.text) {
-
       return;
-
     }
 
 
-    // ------------------------------------------------------------
-    // XAUUSD SIGNAL
-    // ------------------------------------------------------------
+    const chatId =
+      msg.chat.id;
+
+
+    /*
+     XAUUSD SIGNAL
+    */
 
     if (
       msg.text ===
       "📊 XAUUSD Signal"
     ) {
 
-      try {
+      const status =
+        pendingSetup
 
-        const price =
-          cachedMarket.price ||
-          await getGoldPrice();
+          ? `
+👀 Active setup:
 
-
-        let status;
-
-
-        if (pendingSetup) {
-
-          status =
-`👀 Active setup
-
-Direction:
 ${pendingSetup.direction.toUpperCase()}
+${pendingSetup.label}
 
-4H:
-${pendingSetup.htfBias.toUpperCase()}
+Waiting for 5M entry confirmation.
+`
 
-1H:
-${pendingSetup.midBias.toUpperCase()}
+          : candles5m.length < 100
 
-15M:
-Liquidity sweep + BOS + FVG
+            ? `
+⏳ Building market history.
 
-⏳ Waiting for 5M retest.`;
+5M candles:
+${candles5m.length}/100
+`
 
-        } else {
+            : `
+🔎 No complete top-down setup right now.
 
-          status =
-`🔎 No active setup.
-
-The bot is waiting for:
-
-4H bias
-→ 1H confirmation
-→ 15M liquidity sweep
-→ 15M BOS
-→ FVG/OB
-→ 5M retest`;
-
-        }
+The bot is scanning:
+4H → 1H → 15M → 5M
+`;
 
 
-        await bot.sendMessage(
+      await bot.sendMessage(
+        chatId,
 
-          msg.chat.id,
-
-`🔎 XAUUSD TOP-DOWN MARKET CHECK
+`📊 XAUUSD MARKET CHECK
 
 💰 Price:
-${price.toFixed(2)}
-
-📡 Market data:
-Twelve Data OHLC
+${
+  lastMarketPrice !== null
+    ? lastMarketPrice.toFixed(2)
+    : "Unavailable"
+}
 
 ${status}
 
-⚠️ No signal is generated
-unless the complete sequence
-is confirmed.`
-
-        );
-
-      } catch (error) {
-
-        console.error(
-          "Signal button error:",
-          error.message
-        );
-
-
-        bot.sendMessage(
-
-          msg.chat.id,
-
-          "⚠️ XAUUSD market data is temporarily unavailable."
-
-        );
-
-      }
+The bot will only send a trade after the complete top-down conditions agree.`
+      );
 
     }
 
 
-    // ------------------------------------------------------------
-    // LIVE PRICE
-    // ------------------------------------------------------------
+    /*
+     LIVE PRICE
+    */
 
-    if (
+    else if (
       msg.text ===
       "💰 Live Price"
     ) {
 
-      try {
+      await bot.sendMessage(
+        chatId,
 
-        const price =
-          cachedMarket.price ||
-          await getGoldPrice();
+`💰 XAUUSD LIVE DATA
 
+Price:
+${
+  lastMarketPrice !== null
+    ? lastMarketPrice.toFixed(2)
+    : "Unavailable"
+}
 
-        await bot.sendMessage(
+5M candles:
+${candles5m.length}
 
-          msg.chat.id,
-
-`💰 XAUUSD LIVE PRICE
-
-🪙 ${price.toFixed(2)}
-
-📡 Source:
-Twelve Data
-
-⏱️ Updated:
-${new Date().toLocaleTimeString()}`
-
-        );
-
-      } catch (error) {
-
-        bot.sendMessage(
-
-          msg.chat.id,
-
-          "⚠️ Unable to retrieve XAUUSD price."
-
-        );
-
-      }
+Last update:
+${
+  lastMarketUpdate
+    ? new Date(
+        lastMarketUpdate
+      ).toLocaleString()
+    : "Not yet available"
+}`
+      );
 
     }
 
 
-    // ------------------------------------------------------------
-    // AUTO SIGNALS
-    // ------------------------------------------------------------
+    /*
+     AUTO SIGNALS
+    */
 
-    if (
+    else if (
       msg.text ===
       "🔔 Auto Signals"
     ) {
 
-      const existing =
-        subscribers.get(
-          msg.chat.id
-        );
-
-
       subscribers.set(
-
-        msg.chat.id,
-
+        chatId,
         {
 
           username:
-            msg.from.username ||
+            msg.from?.username ||
             null,
 
           firstName:
-            msg.from.first_name ||
+            msg.from?.first_name ||
             "Unknown",
 
           joinedAt:
-            existing
-              ? existing.joinedAt
+            subscribers.has(chatId)
+              ? subscribers.get(chatId).joinedAt
               : Date.now()
 
         }
-
       );
 
 
       await bot.sendMessage(
-
-        msg.chat.id,
+        chatId,
 
 `🔔 AUTOMATIC SIGNALS ENABLED
 
@@ -3248,141 +2723,131 @@ The bot will scan XAUUSD using:
 
 4H → overall bias
 1H → confirmation
-15M → liquidity + BOS
+15M → liquidity sweep
+15M → BOS
 15M → FVG + OB
 5M → entry confirmation
 
-The bot will NOT send a trade merely because
-a small 5M breakout occurs.
+The bot will NOT enter simply because a small 5M breakout occurs.
 
 All higher-timeframe conditions must agree first.`
-
       );
 
     }
 
 
-    // ------------------------------------------------------------
-    // STOP SIGNALS
-    // ------------------------------------------------------------
+    /*
+     STOP ALERTS
+    */
 
-    if (
+    else if (
       msg.text ===
       "🔕 Stop Alerts"
     ) {
 
       subscribers.delete(
-        msg.chat.id
+        chatId
       );
 
 
       await bot.sendMessage(
-
-        msg.chat.id,
+        chatId,
 
 `🔕 AUTOMATIC SIGNALS STOPPED
 
-You will no longer receive
-automatic XAUUSD signals.
+You will no longer receive automatic trade alerts.
 
-Turn them back on with:
-
-🔔 Auto Signals`
-
+Press 🔔 Auto Signals to enable them again.`
       );
 
     }
 
 
-    // ------------------------------------------------------------
-    // HOW IT WORKS
-    // ------------------------------------------------------------
+    /*
+     HOW IT WORKS
+    */
 
-    if (
+    else if (
       msg.text ===
       "📖 How It Works"
     ) {
 
       await bot.sendMessage(
+        chatId,
 
-        msg.chat.id,
-
-`📖 HOW THE NEW STRATEGY WORKS
+`📖 HOW THE TOP-DOWN ENGINE WORKS
 
 1️⃣ 4H
 
-Determines the major market structure.
+Determines the overall market structure.
+
+Bullish:
+Higher High + Higher Low
+
+Bearish:
+Lower High + Lower Low
+
 
 2️⃣ 1H
 
 Must confirm the 4H direction.
 
+If 4H and 1H disagree:
+NO TRADE.
+
+
 3️⃣ 15M
 
 The bot waits for a liquidity sweep.
 
-4️⃣ 15M
+Then it waits for a 15M break of structure.
 
-The sweep must be followed by
-strong displacement and BOS.
+After the BOS it searches for:
 
-5️⃣ 15M
+🟨 Fair Value Gap
+🟦 Order Block
 
-The displacement must create
-a valid FVG.
 
-6️⃣ 15M
+4️⃣ 5M
 
-The bot identifies the relevant
-Order Block.
+Price must return to the 15M entry zone.
 
-7️⃣ 5M
+A confirming 5M candle must then close in the trade direction.
 
-Price must return to the zone.
 
-8️⃣ 5M
+5️⃣ SIGNAL
 
-A rejection/confirmation candle
-must appear.
-
-9️⃣ ENTRY
-
-Only then is the signal sent.
-
-🚫 If the higher timeframes disagree,
-there is NO trade.`
-
+Only after all conditions agree does the bot send the XAUUSD signal.`
       );
 
     }
 
 
-    // ------------------------------------------------------------
-    // SETTINGS
-    // ------------------------------------------------------------
+    /*
+     SETTINGS
+    */
 
-    if (
+    else if (
       msg.text ===
       "⚙️ Settings"
     ) {
 
       await bot.sendMessage(
-
-        msg.chat.id,
+        chatId,
 
 `⚙️ SETTINGS
 
-Symbol:
-XAU/USD
+Market:
+XAUUSD
 
 Strategy:
-Top-Down SMC
+Top-down SMC
 
 4H:
-Market bias
+Overall bias
 
 1H:
-Bias confirmation
+Confirmation
 
 15M:
 Liquidity + BOS + FVG + OB
@@ -3390,22 +2855,21 @@ Liquidity + BOS + FVG + OB
 5M:
 Entry confirmation
 
-Minimum R:R:
-1.5
+Target:
+${TP_PIPS_MIN}-${TP_PIPS_MAX} pips
 
-Signal cooldown:
-30 minutes
+Data:
+Twelve Data 5M OHLC
 
-Setup expiry:
-3 hours
+5M candles:
+${candles5m.length}
 
-Candles currently loaded:
-
-4H: ${cachedMarket.htf.length}
-1H: ${cachedMarket.mid.length}
-15M: ${cachedMarket.setup.length}
-5M: ${cachedMarket.entry.length}`
-
+Open signal:
+${
+  hasOpenSignal()
+    ? "YES"
+    : "NO"
+}`
       );
 
     }
@@ -3414,47 +2878,196 @@ Candles currently loaded:
 );
 
 
-// ================================================================
-// INITIAL MONITOR
-// ================================================================
+/* =========================================================
+   WEBHOOK STARTUP
+   ========================================================= */
 
-console.log(
-  "🔥 Starting MONEY MAKING MACHINE BOT..."
+async function configureTelegramWebhook() {
+
+  const webhookUrl =
+    `${PUBLIC_URL}${WEBHOOK_PATH}`;
+
+
+  try {
+
+    /*
+     Remove any previous webhook first.
+     This also makes migration from an old webhook clean.
+    */
+
+    await bot.deleteWebHook();
+
+
+    const options = {};
+
+
+    if (WEBHOOK_SECRET) {
+
+      options.secret_token =
+        WEBHOOK_SECRET;
+
+    }
+
+
+    await bot.setWebHook(
+      webhookUrl,
+      options
+    );
+
+
+    const info =
+      await bot.getWebHookInfo();
+
+
+    console.log(
+      "🔥 Telegram webhook configured:"
+    );
+
+    console.log(
+      webhookUrl
+    );
+
+    console.log(
+      "[TELEGRAM] pending updates:",
+      info.pending_update_count
+    );
+
+
+  } catch (error) {
+
+    console.error(
+      "[TELEGRAM WEBHOOK ERROR]",
+      error.message
+    );
+
+    /*
+     Do not crash the web service.
+     Render can still serve /health and /admin.
+    */
+
+  }
+
+}
+
+
+/* =========================================================
+   MARKET SCHEDULER
+   ========================================================= */
+
+/*
+   Fetch immediately at startup.
+
+   After that, run around every 5 minutes.
+
+   We intentionally do NOT run every 30 seconds.
+*/
+
+let marketTimer = null;
+
+
+function startMarketScheduler() {
+
+  fetch5mHistory();
+
+
+  marketTimer =
+    setInterval(
+      () => {
+
+        fetch5mHistory();
+
+      },
+      5 * 60 * 1000
+    );
+
+}
+
+
+/* =========================================================
+   GRACEFUL SHUTDOWN
+   ========================================================= */
+
+async function shutdown(
+  signal
+) {
+
+  console.log(
+    `[SYSTEM] ${signal} received.`
+  );
+
+
+  if (marketTimer) {
+
+    clearInterval(
+      marketTimer
+    );
+
+  }
+
+
+  try {
+
+    await bot.deleteWebHook();
+
+  } catch (error) {
+
+    console.error(
+      "Webhook cleanup error:",
+      error.message
+    );
+
+  }
+
+
+  process.exit(0);
+
+}
+
+
+process.once(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
+
+process.once(
+  "SIGINT",
+  () => shutdown("SIGINT")
 );
 
 
-monitorMarket();
-
-
-// ================================================================
-// PERIODIC MONITOR
-// ================================================================
-
-setInterval(
-  monitorMarket,
-  60 * 1000
-);
-
-
-// ================================================================
-// SERVER
-// ================================================================
+/* =========================================================
+   START SERVER
+   ========================================================= */
 
 app.listen(
   PORT,
-  () => {
+  async () => {
 
     console.log(
-      `🔥 MONEY MAKING MACHINE BOT running on port ${PORT}`
+      "🔥 MONEY MAKING MACHINE BOT running"
     );
 
     console.log(
-      `🌐 Port: ${PORT}`
+      `🔥 Port: ${PORT}`
     );
 
     console.log(
-      `📊 Strategy: 4H → 1H → 15M → 5M`
+      "📊 Strategy: 4H → 1H → 15M → 5M"
     );
+
+    console.log(
+      "📡 Market data: Twelve Data 5M"
+    );
+
+    console.log(
+      "🔐 Telegram: WEBHOOK MODE"
+    );
+
+
+    await configureTelegramWebhook();
+
+
+    startMarketScheduler();
 
   }
 );
