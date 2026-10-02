@@ -29,8 +29,6 @@ const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
 const SETUP_EXPIRY_MS = 90 * 60 * 1000;
 const LTF = { interval: "5min", ms: 5 * 60 * 1000 };
 const HTF = { interval: "1h", ms: 60 * 60 * 1000 };
-const POLL_MS = 3 * 60 * 1000;     // 480 calls/day
-const HTF_POLL_MS = 30 * 60 * 1000;// 48 calls/day (free tier = 800/day)
 
 // ===============================
 // ADMIN LOGIN
@@ -103,7 +101,26 @@ async function fetchCandles(tf, size) {
     .sort((a, b) => a.time - b.time);
 }
 
+let blockedUntil = 0; // pause API calls after a rate-limit error
+
+function handleApiError(e) {
+  const data = e.response?.data;
+  const msg = data?.message || e.message;
+  if (e.response?.status === 429 || data?.code === 429) {
+    if (/day/i.test(msg)) {
+      const d = new Date();
+      blockedUntil = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 5);
+      console.error("[API] Daily credits used up - pausing until 00:05 UTC");
+    } else {
+      blockedUntil = Date.now() + 90000;
+      console.error("[API] Per-minute limit hit - pausing 90s");
+    }
+  }
+  return msg;
+}
+
 async function refreshLTF() {
+  if (Date.now() < blockedUntil) return;
   try {
     allCandles = await fetchCandles(LTF, 200);
     candles = allCandles.filter(c => c.time + LTF.ms <= Date.now());
@@ -118,24 +135,26 @@ async function refreshLTF() {
       analyzeMarket();
     }
   } catch (e) {
-    lastFetchError = e.response?.data?.message || e.message;
-    console.error("5m refresh failed:", e.response?.data || e.message);
+    lastFetchError = handleApiError(e);
+    console.error("5m refresh failed:", lastFetchError);
   }
 }
 
 async function refreshHTF() {
+  if (Date.now() < blockedUntil) return;
   try {
     const all = await fetchCandles(HTF, 120);
     htfCandles = all.filter(c => c.time + HTF.ms <= Date.now());
     htfTrend = computeHTFTrend();
     console.log(`[HTF] trend: ${htfTrend}`);
   } catch (e) {
-    console.error("1h refresh failed:", e.message);
+    console.error("1h refresh failed:", handleApiError(e));
   }
 }
 
 async function getGoldPrice() {
   if (lastPrice && allCandles.length) return lastPrice;
+  if (Date.now() < blockedUntil) throw new Error("API limit reached");
   const r = await axios.get("https://api.twelvedata.com/price", {
     params: { symbol: "XAU/USD", apikey: TD_KEY }, timeout: 10000
   });
@@ -618,8 +637,29 @@ Only one signal at a time. London/NY hours only.`);
 // ===============================
 // START
 // ===============================
+// Fetch only when a new candle has just closed, and only during
+// trading hours (or while a signal is open). ~170 calls/day vs 800 limit.
+let lastLtfSlot = Math.floor(Date.now() / LTF.ms);
+let lastHtfSlot = Math.floor(Date.now() / HTF.ms);
+
+function tick() {
+  const now = Date.now();
+  const active = inSession() || hasOpenSignal();
+
+  const ltfSlot = Math.floor(now / LTF.ms);
+  if (ltfSlot !== lastLtfSlot && now - ltfSlot * LTF.ms >= 10000 && (active || candles.length === 0)) {
+    lastLtfSlot = ltfSlot;
+    refreshLTF();
+  }
+
+  const htfSlot = Math.floor(now / HTF.ms);
+  if (htfSlot !== lastHtfSlot && now - htfSlot * HTF.ms >= 15000 && (active || htfCandles.length === 0)) {
+    lastHtfSlot = htfSlot;
+    refreshHTF();
+  }
+}
+
 refreshHTF().then(refreshLTF);
-setInterval(refreshLTF, POLL_MS);
-setInterval(refreshHTF, HTF_POLL_MS);
+setInterval(tick, 20000);
 
 app.listen(PORT, () => console.log(`🔥 MONEY MAKING MACHINE BOT running on port ${PORT}`));
