@@ -727,7 +727,7 @@ function fireSignal(sig) {
 
   const message =
 `🚨 XAUUSD ${direction} SIGNAL
-Top-Down SMC
+🧠 Top-Down SMC
 
 ${emoji} ${direction} @ ${sig.entry.toFixed(2)}
 
@@ -736,9 +736,9 @@ ${emoji} ${direction} @ ${sig.entry.toFixed(2)}
 ⚖️ Risk:Reward 1:${sig.rr.toFixed(1)} (${sig.tpType})
 
 🧭 Top-down analysis
-• 4H: ${plan.dir.toUpperCase()} bias, entry zone in ${side}
-• 15M: ${plan.label} ${plan.dir} + FVG, Order Block ${plan.zone.bottom.toFixed(2)}-${plan.zone.top.toFixed(2)}${confluences.length ? " (" + confluences.join(", ") + ")" : ""}
-• 5M: price tapped the zone, then ${sig.ltfLabel}
+• 📈 4H: ${plan.dir.toUpperCase()} bias, entry zone in ${side}
+• 🟦 15M: ${plan.label} ${plan.dir} + FVG, Order Block ${plan.zone.bottom.toFixed(2)}-${plan.zone.top.toFixed(2)}${confluences.length ? " (" + confluences.join(", ") + ")" : ""}
+• ✅ 5M: price tapped the zone, then ${sig.ltfLabel}
 
 ⚠️ Always manage your own risk. This is not financial advice.`;
 
@@ -802,8 +802,8 @@ function checkOpenSignals(currentPrice) {
     const closeMessage =
 `${resultEmoji} SIGNAL CLOSED - ${resultText}
 
-${signal.direction} @ ${signal.entryPrice.toFixed(2)}
-Closed @ ${currentPrice.toFixed(2)}
+📌 ${signal.direction} @ ${signal.entryPrice.toFixed(2)}
+🏁 Closed @ ${currentPrice.toFixed(2)}
 
 ${signal.status === "win" ? "🎯 Target reached." : "🛡️ Stop loss protected your downside."}`;
 
@@ -948,6 +948,7 @@ app.get("/admin", requireAdminAuth, (req, res) => {
 </head>
 <body>
   <h1>🔥 Money Making Machine - Admin</h1>
+  <p><a href="/panel" style="color:#f5c542">📈 Open the live chart panel</a></p>
 
   <div class="stats">
     <div class="card"><div class="label">Bot uptime</div><div class="value">${formatUptime(Date.now() - botStartedAt)}</div></div>
@@ -1020,6 +1021,591 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
   res.redirect("/admin");
 });
 
+// ================================================================
+// LIVE PANEL  -  open  your-bot-url/panel  (same login as /admin)
+// Shows the candles and the top-down SMC read-out of the bot.
+// ================================================================
+
+function structureFor(tf) {
+  const arr = candles[tf];
+  if (!arr || arr.length < 12) return [];
+
+  const st = analyzeStructure(arr, SWING_LOOKBACK[tf]);
+
+  return st.breaks.slice(-12).map(b => ({
+    t: arr[b.index].t,
+    dir: b.dir,
+    type: b.type,
+    level: b.level
+  }));
+}
+
+// Read-only version of the 5M entry check, used to show progress on the panel
+function describeProgress() {
+  const plan = activePlan;
+  const c = candles["5m"];
+
+  if (!plan || c.length < 30) return null;
+
+  const buy = plan.dir === "bullish";
+  const z = plan.zone;
+
+  const startIdx = c.findIndex(x => x.t >= plan.breakTime);
+  if (startIdx < 0) return { tapped: false, note: "Waiting for 5M candles after the 15M break" };
+
+  const last = c.length - 1;
+  let touchIdx = -1;
+
+  for (let i = Math.max(startIdx, c.length - TOUCH_LOOKBACK_5M); i <= last; i++) {
+    if (c[i].low <= z.top && c[i].high >= z.bottom) {
+      touchIdx = i;
+      break;
+    }
+  }
+
+  if (touchIdx < 0) return { tapped: false, note: "Waiting for price to return to the zone" };
+
+  let extIdx = touchIdx;
+  for (let i = touchIdx; i <= last; i++) {
+    if (buy ? c[i].low < c[extIdx].low : c[i].high > c[extIdx].high) extIdx = i;
+  }
+
+  let level = null;
+  for (let k = extIdx - 1; k >= Math.max(1, touchIdx - 6); k--) {
+    if (buy && c[k].high >= c[k - 1].high && c[k].high >= c[k + 1].high) {
+      level = c[k].high;
+      break;
+    }
+    if (!buy && c[k].low <= c[k - 1].low && c[k].low <= c[k + 1].low) {
+      level = c[k].low;
+      break;
+    }
+  }
+
+  return {
+    tapped: true,
+    tapTime: c[touchIdx].t,
+    level,
+    note: level === null
+      ? "Zone tapped - waiting for a 5M structure level to form"
+      : "Zone tapped - waiting for a 5M candle to close beyond the level"
+  };
+}
+
+async function buildPanelData() {
+  let price = null;
+
+  try {
+    price = await getGoldPrice();
+  } catch (e) {
+    price = null;
+  }
+
+  const pack = arr => (arr || []).map(c => ({ t: c.t, o: c.open, h: c.high, l: c.low, c: c.close }));
+
+  const htf = getHTF();
+
+  let htfOut = null;
+  if (htf) {
+    htfOut = {
+      bias: htf.bias,
+      rangeHigh: htf.rangeHigh,
+      rangeLow: htf.rangeLow,
+      eq: htf.eq,
+      zone: price ? (price < htf.eq ? "discount" : "premium") : null
+    };
+  }
+
+  let planOut = null;
+  if (activePlan) {
+    const p = activePlan;
+    planOut = {
+      dir: p.dir,
+      label: p.label,
+      zoneTop: p.zone.top,
+      zoneBottom: p.zone.bottom,
+      fvgTop: p.fvg ? p.fvg.top : null,
+      fvgBottom: p.fvg ? p.fvg.bottom : null,
+      sweep: p.sweep,
+      overlap: p.overlap,
+      obTime: p.obTime,
+      breakTime: p.breakTime,
+      createdAt: p.createdAt
+    };
+  }
+
+  const hr = new Date().getUTCHours();
+
+  return {
+    now: Date.now(),
+    price,
+    htf: htfOut,
+    plan: planOut,
+    progress: describeProgress(),
+    candles: {
+      "5m": pack(candles["5m"]),
+      "15m": pack(candles["15m"]),
+      "4h": pack(candles["4h"])
+    },
+    structure: {
+      "5m": structureFor("5m"),
+      "15m": structureFor("15m"),
+      "4h": structureFor("4h")
+    },
+    signals: signalHistory.slice(0, 15).map(s => ({
+      time: s.time,
+      dir: s.direction,
+      label: s.label,
+      entry: s.entryPrice,
+      sl: s.stopLoss,
+      tp: s.takeProfit,
+      status: s.status,
+      closedAt: s.closedAt,
+      closePrice: s.closePrice
+    })),
+    status: {
+      marketClosed: isMarketClosed(),
+      session: !SESSION_FILTER || (hr >= SESSION_START_UTC && hr < SESSION_END_UTC),
+      dataStatus,
+      creditsUsed,
+      paused: Date.now() < pausedUntil,
+      lastFetch: {
+        "5m": lastFetchOk["5m"] || 0,
+        "15m": lastFetchOk["15m"] || 0,
+        "4h": lastFetchOk["4h"] || 0
+      },
+      wins: signalHistory.filter(s => s.status === "win").length,
+      losses: signalHistory.filter(s => s.status === "loss").length
+    }
+  };
+}
+
+app.get("/api/panel", requireAdminAuth, async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    res.json(await buildPanelData());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/panel", requireAdminAuth, (req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.type("html").send(PANEL_HTML);
+});
+
+const PANEL_HTML = String.raw`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MMM Live Panel</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0f1115; color: #e6e8ee; font-family: -apple-system, Arial, sans-serif; font-size: 14px; }
+  #top { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 4px; gap: 8px; flex-wrap: wrap; }
+  #price { font-size: 28px; font-weight: 700; }
+  .chip { display: inline-block; padding: 3px 9px; border-radius: 12px; font-size: 12px; margin: 2px 3px 2px 0; background: #1b1f27; }
+  .up { color: #26a69a; }
+  .down { color: #ef5350; }
+  .warn { color: #ffc107; }
+  .dim { color: #8b93a3; }
+  #tabs { display: flex; gap: 6px; padding: 4px 12px 8px; }
+  #tabs button { flex: 1; background: #1b1f27; color: #cfd3dc; border: 1px solid #2a2f3a; border-radius: 8px; padding: 9px 0; font-size: 14px; }
+  #tabs button.on { background: #2b6fe0; color: #fff; border-color: #2b6fe0; }
+  #wrap { position: relative; height: 52vh; min-height: 300px; margin: 0 6px; }
+  #chart { position: absolute; left: 0; top: 0; right: 0; bottom: 0; }
+  #ov { position: absolute; left: 0; top: 0; pointer-events: none; }
+  #msg { position: absolute; left: 0; right: 0; top: 45%; text-align: center; color: #8b93a3; pointer-events: none; }
+  #err { color: #ef5350; padding: 4px 12px; font-size: 12px; }
+  .card { background: #1b1f27; border-radius: 10px; padding: 12px; margin: 10px 12px; }
+  .card h3 { margin: 0 0 8px; font-size: 14px; color: #f5c542; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px solid #262b35; }
+  .row:last-child { border-bottom: none; }
+  .row span:last-child { text-align: right; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #262b35; }
+  th { color: #8b93a3; font-weight: normal; }
+  .legend { font-size: 11px; color: #8b93a3; padding: 0 12px 6px; }
+</style>
+</head>
+<body>
+<div id="top">
+  <div id="price">--</div>
+  <div id="chips"></div>
+</div>
+<div id="tabs">
+  <button data-tf="5m" class="on">5M</button>
+  <button data-tf="15m">15M</button>
+  <button data-tf="4h">4H</button>
+</div>
+<div id="wrap">
+  <div id="chart"></div>
+  <canvas id="ov"></canvas>
+  <div id="msg">Loading candles...</div>
+</div>
+<div class="legend">Green box = 15M order block zone, yellow = 15M fair value gap, purple line = 4H 50% level, arrows = BOS / CHoCH and signals</div>
+<div id="err"></div>
+<div id="panel"></div>
+
+<script>
+(function () {
+  var TZ = -new Date().getTimezoneOffset() * 60;
+  var MS = { "5m": 300000, "15m": 900000, "4h": 14400000 };
+  var tf = "5m";
+  var data = null;
+  var chart = null;
+  var series = null;
+  var plines = [];
+  var zones = [];
+  var sig = "";
+  var needFit = true;
+
+  function $(id) { return document.getElementById(id); }
+  function fmt(n) { return (n === null || n === undefined || isNaN(n)) ? "--" : Number(n).toFixed(2); }
+  function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function hhmm(ms) { if (!ms) return "--"; return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+  function ago(ms) {
+    if (!ms) return "never";
+    var s = Math.round((Date.now() - ms) / 1000);
+    if (s < 90) return s + "s ago";
+    var m = Math.round(s / 60);
+    if (m < 90) return m + " min ago";
+    return Math.round(m / 60) + " h ago";
+  }
+  function showErr(t) { $("err").textContent = t || ""; }
+  function chip(txt, cls) { return '<span class="chip ' + (cls || "") + '">' + txt + '</span>'; }
+  function row(a, b) { return '<div class="row"><span>' + a + '</span><span>' + b + '</span></div>'; }
+
+  function loadLib(cb) {
+    if (window.LightweightCharts) { cb(); return; }
+    var urls = [
+      "https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js",
+      "https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"
+    ];
+    var i = 0;
+    function next() {
+      if (i >= urls.length) { showErr("Could not load the chart library. Check your internet connection."); return; }
+      var s = document.createElement("script");
+      s.src = urls[i++];
+      s.onload = function () { if (window.LightweightCharts) cb(); else next(); };
+      s.onerror = next;
+      document.head.appendChild(s);
+    }
+    next();
+  }
+
+  function initChart() {
+    var el = $("chart");
+    chart = LightweightCharts.createChart(el, {
+      width: el.clientWidth,
+      height: el.clientHeight,
+      layout: { background: { type: "solid", color: "#0f1115" }, textColor: "#cfd3dc" },
+      grid: { vertLines: { color: "#1b1f27" }, horzLines: { color: "#1b1f27" } },
+      rightPriceScale: { borderColor: "#2a2f3a" },
+      timeScale: { borderColor: "#2a2f3a", timeVisible: true, secondsVisible: false, rightOffset: 6 },
+      crosshair: { mode: 0 }
+    });
+    series = chart.addCandlestickSeries({
+      upColor: "#26a69a", downColor: "#ef5350", borderVisible: false,
+      wickUpColor: "#26a69a", wickDownColor: "#ef5350"
+    });
+    window.addEventListener("resize", function () {
+      chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+    });
+    if (data) render();
+    loop();
+  }
+
+  function candlesOf() { return (data && data.candles && data.candles[tf]) || []; }
+
+  function buildMarkers(cs) {
+    var out = [];
+    if (!cs.length) return out;
+    var first = cs[0].t;
+    var last = cs[cs.length - 1].t;
+    var br = (data.structure && data.structure[tf]) || [];
+    br.forEach(function (b) {
+      if (b.t < first || b.t > last) return;
+      out.push({
+        time: b.t / 1000 + TZ,
+        position: b.dir === "bullish" ? "belowBar" : "aboveBar",
+        color: b.dir === "bullish" ? "#26a69a" : "#ef5350",
+        shape: b.dir === "bullish" ? "arrowUp" : "arrowDown",
+        text: b.type
+      });
+    });
+    data.signals.forEach(function (s) {
+      var t0 = Math.floor(s.time / MS[tf]) * MS[tf];
+      if (t0 >= first && t0 <= last) {
+        out.push({
+          time: t0 / 1000 + TZ,
+          position: s.dir === "BUY" ? "belowBar" : "aboveBar",
+          color: "#ffc107",
+          shape: s.dir === "BUY" ? "arrowUp" : "arrowDown",
+          text: s.dir
+        });
+      }
+      if (s.closedAt) {
+        var t1 = Math.floor(s.closedAt / MS[tf]) * MS[tf];
+        if (t1 >= first && t1 <= last) {
+          out.push({
+            time: t1 / 1000 + TZ,
+            position: s.dir === "BUY" ? "aboveBar" : "belowBar",
+            color: s.status === "win" ? "#26a69a" : "#ef5350",
+            shape: "circle",
+            text: s.status === "win" ? "TP" : "SL"
+          });
+        }
+      }
+    });
+    out.sort(function (a, b) { return a.time - b.time; });
+    return out;
+  }
+
+  function buildZones(cs) {
+    zones = [];
+    if (!cs.length) return;
+    var firstT = cs[0].t;
+    var tEnd = cs[cs.length - 1].t + MS[tf] * 60;
+    var h = data.htf;
+    if (h && h.eq) {
+      zones.push({ t1: firstT, t2: tEnd, top: h.rangeHigh, bottom: h.eq, fill: "rgba(239,83,80,0.07)", stroke: null, label: "PREMIUM" });
+      zones.push({ t1: firstT, t2: tEnd, top: h.eq, bottom: h.rangeLow, fill: "rgba(38,166,154,0.07)", stroke: null, label: "DISCOUNT" });
+    }
+    var p = data.plan;
+    if (p) {
+      var buy = p.dir === "bullish";
+      zones.push({
+        t1: p.obTime, t2: tEnd, top: p.zoneTop, bottom: p.zoneBottom,
+        fill: buy ? "rgba(38,166,154,0.30)" : "rgba(239,83,80,0.30)",
+        stroke: buy ? "#26a69a" : "#ef5350",
+        label: "15M OB " + (buy ? "BUY" : "SELL") + " zone"
+      });
+      if (p.fvgTop !== null && p.fvgTop !== undefined) {
+        zones.push({
+          t1: p.obTime, t2: tEnd, top: p.fvgTop, bottom: p.fvgBottom,
+          fill: "rgba(255,193,7,0.18)", stroke: "#ffc107", label: "15M FVG"
+        });
+      }
+    }
+  }
+
+  function render() {
+    if (!data || !series) return;
+    var cs = candlesOf();
+    $("msg").style.display = cs.length ? "none" : "block";
+
+    var key = tf + ":" + cs.length + ":" + (cs.length ? cs[cs.length - 1].t : 0);
+    if (key !== sig) {
+      sig = key;
+      series.setData(cs.map(function (x) {
+        return { time: x.t / 1000 + TZ, open: x.o, high: x.h, low: x.l, close: x.c };
+      }));
+      if (needFit && cs.length) {
+        var n = cs.length;
+        chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 90), to: n + 12 });
+        needFit = false;
+      }
+    }
+
+    for (var i = 0; i < plines.length; i++) series.removePriceLine(plines[i]);
+    plines = [];
+    function pl(price, color, title, style) {
+      if (price === null || price === undefined) return;
+      plines.push(series.createPriceLine({
+        price: price, color: color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: title
+      }));
+    }
+    if (data.price) pl(data.price, "#ffffff", "live", 2);
+    if (data.htf && data.htf.eq) pl(data.htf.eq, "#b388ff", "4H 50%", 2);
+    var openSig = null;
+    for (var j = 0; j < data.signals.length; j++) {
+      if (data.signals[j].status === "open") { openSig = data.signals[j]; break; }
+    }
+    if (openSig) {
+      pl(openSig.entry, "#9e9e9e", "entry", 0);
+      pl(openSig.sl, "#ef5350", "SL", 0);
+      pl(openSig.tp, "#26a69a", "TP", 0);
+    }
+
+    series.setMarkers(buildMarkers(cs));
+    buildZones(cs);
+  }
+
+  function draw() {
+    var wrap = $("wrap");
+    var cv = $("ov");
+    var w = wrap.clientWidth;
+    var h = wrap.clientHeight;
+    if (cv.width !== w) cv.width = w;
+    if (cv.height !== h) cv.height = h;
+    var ctx = cv.getContext("2d");
+    ctx.clearRect(0, 0, w, h);
+    if (!chart || !series || !data) return;
+    var cs = candlesOf();
+    if (!cs.length) return;
+
+    var ts = chart.timeScale();
+    var plotW = ts.width ? ts.width() : w - 60;
+    var firstT = cs[0].t;
+    var lastT = cs[cs.length - 1].t;
+
+    zones.forEach(function (z) {
+      var x1 = ts.timeToCoordinate(Math.max(z.t1, firstT) / 1000 + TZ);
+      var x2 = z.t2 > lastT ? plotW : ts.timeToCoordinate(z.t2 / 1000 + TZ);
+      if (x1 === null || x1 === undefined) x1 = 0;
+      if (x2 === null || x2 === undefined) x2 = plotW;
+      x1 = Math.max(0, x1);
+      x2 = Math.min(plotW, x2);
+      if (x2 <= x1) return;
+      var ya = series.priceToCoordinate(z.top);
+      var yb = series.priceToCoordinate(z.bottom);
+      if (ya === null || yb === null || ya === undefined || yb === undefined) return;
+      var yTop = Math.min(ya, yb);
+      var hh = Math.abs(yb - ya);
+      ctx.fillStyle = z.fill;
+      ctx.fillRect(x1, yTop, x2 - x1, hh);
+      if (z.stroke) {
+        ctx.strokeStyle = z.stroke;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x1, yTop, x2 - x1, hh);
+      }
+      if (hh > 14 && z.label) {
+        ctx.fillStyle = z.stroke || "rgba(200,200,200,0.55)";
+        ctx.font = "11px Arial";
+        ctx.fillText(z.label, x1 + 4, yTop + 12);
+      }
+    });
+  }
+
+  function loop() {
+    try { draw(); } catch (e) { }
+    requestAnimationFrame(loop);
+  }
+
+  function renderPanel() {
+    var d = data;
+    var h = d.htf;
+    var p = d.plan;
+    var pr = d.progress;
+    var s = d.status;
+
+    $("price").textContent = d.price ? fmt(d.price) : "--";
+
+    var chips = chip("&#9679; LIVE " + hhmm(d.now), "up");
+    if (h && h.bias) chips += chip("4H " + h.bias.toUpperCase(), h.bias === "bullish" ? "up" : "down");
+    else chips += chip("4H bias unclear", "dim");
+    if (h && h.zone) chips += chip(h.zone.toUpperCase(), h.zone === "discount" ? "up" : "down");
+    chips += chip(s.marketClosed ? "Market closed" : "Market open", s.marketClosed ? "warn" : "up");
+    chips += chip(s.session ? "Signal hours" : "Outside signal hours", s.session ? "up" : "dim");
+    $("chips").innerHTML = chips;
+
+    var html = '<div class="card"><h3>Top-down check</h3>';
+
+    html += row("1&#65039;&#8419; 4H bias", h && h.bias
+      ? '<b class="' + (h.bias === "bullish" ? "up" : "down") + '">' + h.bias.toUpperCase() + '</b>'
+      : '<span class="dim">not clear yet</span>');
+    if (h) {
+      html += row("4H range", fmt(h.rangeLow) + " - " + fmt(h.rangeHigh));
+      html += row("50% level", fmt(h.eq));
+      html += row("Price is in", h.zone ? (h.zone === "discount" ? '<span class="up">DISCOUNT (buys)</span>' : '<span class="down">PREMIUM (sells)</span>') : "--");
+    }
+
+    if (p) {
+      var buy = p.dir === "bullish";
+      html += row("2&#65039;&#8419; 15M break", '<b class="' + (buy ? "up" : "down") + '">' + esc(p.label) + " " + p.dir + '</b> &#10003;');
+      html += row("Displacement (FVG)", p.fvgTop !== null && p.fvgTop !== undefined ? fmt(p.fvgBottom) + " - " + fmt(p.fvgTop) + " &#10003;" : "--");
+      html += row("Order Block zone", fmt(p.zoneBottom) + " - " + fmt(p.zoneTop) + " &#10003;");
+      html += row("Liquidity sweep", p.sweep ? '<span class="up">yes &#10003;</span>' : '<span class="dim">no (bonus only)</span>');
+      html += row("OB + FVG overlap", p.overlap ? '<span class="up">yes &#10003;</span>' : '<span class="dim">no</span>');
+    } else {
+      html += row("2&#65039;&#8419; 15M setup", '<span class="dim">searching - no break in the 4H direction yet</span>');
+    }
+
+    if (p && pr) {
+      html += row("3&#65039;&#8419; 5M tap of zone", pr.tapped ? '<span class="up">tapped ' + hhmm(pr.tapTime) + ' &#10003;</span>' : '<span class="warn">waiting</span>');
+      if (pr.level !== null && pr.level !== undefined) html += row("5M needs a close beyond", fmt(pr.level));
+      html += row("Status", esc(pr.note || ""));
+    } else {
+      html += row("3&#65039;&#8419; 5M entry", '<span class="dim">starts after a 15M zone is found</span>');
+    }
+    html += '</div>';
+
+    var openSig = null;
+    for (var i = 0; i < d.signals.length; i++) {
+      if (d.signals[i].status === "open") { openSig = d.signals[i]; break; }
+    }
+    if (openSig) {
+      html += '<div class="card"><h3>Open signal</h3>';
+      html += row("Direction", '<b class="' + (openSig.dir === "BUY" ? "up" : "down") + '">' + openSig.dir + '</b>');
+      html += row("Entry", fmt(openSig.entry));
+      html += row("Stop loss", fmt(openSig.sl));
+      html += row("Take profit", fmt(openSig.tp));
+      html += '</div>';
+    }
+
+    html += '<div class="card"><h3>Recent signals (' + s.wins + ' wins / ' + s.losses + ' losses)</h3>';
+    if (d.signals.length) {
+      html += '<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Result</th></tr>';
+      d.signals.forEach(function (x) {
+        var res = x.status === "win" ? '<span class="up">TP</span>' : x.status === "loss" ? '<span class="down">SL</span>' : '<span class="warn">open</span>';
+        html += '<tr><td>' + new Date(x.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) + '</td><td>' + x.dir + '</td><td>' + fmt(x.entry) + '</td><td>' + fmt(x.sl) + '</td><td>' + fmt(x.tp) + '</td><td>' + res + '</td></tr>';
+      });
+      html += '</table>';
+    } else {
+      html += '<span class="dim">No signals yet.</span>';
+    }
+    html += '</div>';
+
+    html += '<div class="card"><h3>Data</h3>';
+    html += row("Status", esc(s.dataStatus));
+    html += row("5M candles updated", ago(s.lastFetch["5m"]));
+    html += row("15M candles updated", ago(s.lastFetch["15m"]));
+    html += row("4H candles updated", ago(s.lastFetch["4h"]));
+    html += row("Twelve Data credits used today", s.creditsUsed + " / 800");
+    html += '</div>';
+
+    $("panel").innerHTML = html;
+  }
+
+  function poll() {
+    fetch("/api/panel", { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        data = j;
+        showErr("");
+        render();
+        renderPanel();
+      })
+      .catch(function (e) {
+        showErr("Connection problem: " + e.message + " (retrying)");
+      });
+  }
+
+  var btns = document.querySelectorAll("#tabs button");
+  for (var b = 0; b < btns.length; b++) {
+    btns[b].onclick = function () {
+      tf = this.getAttribute("data-tf");
+      for (var k = 0; k < btns.length; k++) btns[k].className = btns[k] === this ? "on" : "";
+      needFit = true;
+      sig = "";
+      render();
+    };
+  }
+
+  poll();
+  setInterval(poll, 15000);
+  loadLib(initChart);
+})();
+</script>
+</body>
+</html>`;
+
+
 // ===============================
 // START COMMAND
 // ===============================
@@ -1033,14 +1619,14 @@ bot.onText(/\/start/, (msg) => {
 
 Welcome! 👋
 
-Your XAUUSD trading assistant.
+🥇 Your XAUUSD trading assistant.
 
 🧭 Top-down Smart Money analysis
 🚨 Entry alerts
 ⚖️ Minimum 1:2 risk to reward
 🛡️ Clear stop loss and take profit
 
-Choose an option below:`,
+👇 Choose an option below:`,
     mainMenu
   );
 
@@ -1131,9 +1717,9 @@ ${statusText()}
 
 `🔔 AUTOMATIC SIGNALS ENABLED
 
-MONEY MAKING MACHINE BOT will monitor XAUUSD automatically.
+🤖 MONEY MAKING MACHINE BOT will monitor XAUUSD automatically.
 
-You will receive an alert when a full top-down setup is confirmed:
+📩 You will receive an alert when a full top-down setup is confirmed:
 
 🧭 4H bias
 🟦 15M structure break + Order Block + FVG
@@ -1153,9 +1739,9 @@ You will receive an alert when a full top-down setup is confirmed:
 
 `🔕 AUTOMATIC SIGNALS STOPPED
 
-You will no longer receive automatic XAUUSD entry alerts.
+🚫 You will no longer receive automatic XAUUSD entry alerts.
 
-You can turn them back on anytime with:
+🔄 You can turn them back on anytime with:
 
 🔔 Auto Signals`
     );
@@ -1170,21 +1756,21 @@ You can turn them back on anytime with:
 
 `📖 HOW IT WORKS
 
-The bot analyses XAUUSD top-down, like a Smart Money trader:
+🧠 The bot analyses XAUUSD top-down, like a Smart Money trader:
 
 1️⃣ 4H - Bias
-Market structure (BOS / CHoCH) sets the direction. Buys only in discount, sells only in premium of the 4H range.
+📊 Market structure (BOS / CHoCH) sets the direction. Buys only in discount, sells only in premium of the 4H range.
 
 2️⃣ 15M - Zone
-Structure breaks in the 4H direction with displacement (Fair Value Gap). The Order Block behind the move becomes the entry zone.
+🟦 Structure breaks in the 4H direction with displacement (Fair Value Gap). The Order Block behind the move becomes the entry zone.
 
 3️⃣ 5M - Entry
-Price must return to the zone, then a 5M change of character confirms the entry.
+✅ Price must return to the zone, then a 5M change of character confirms the entry.
 
 🛡️ Stop loss goes beyond the sweep / zone.
 🎯 Take profit targets the next swing liquidity, minimum 1:2 risk to reward.
 
-Only one signal at a time, during London and New York hours.`
+🕐 Only one signal at a time, during London and New York hours.`
     );
 
   }
