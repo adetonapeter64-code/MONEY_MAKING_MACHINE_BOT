@@ -1198,55 +1198,97 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>MMM Live Panel</title>
 <style>
-  * { box-sizing: border-box; }
-  body { margin: 0; background: #0f1115; color: #e6e8ee; font-family: -apple-system, Arial, sans-serif; font-size: 14px; }
-  #top { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 4px; gap: 8px; flex-wrap: wrap; }
-  #price { font-size: 28px; font-weight: 700; }
-  .chip { display: inline-block; padding: 3px 9px; border-radius: 12px; font-size: 12px; margin: 2px 3px 2px 0; background: #1b1f27; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; height: 100%; background: #131722; color: #d1d4dc; font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; font-size: 14px; overflow: hidden; }
+  #app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
   .up { color: #26a69a; }
   .down { color: #ef5350; }
-  .warn { color: #ffc107; }
-  .dim { color: #8b93a3; }
-  #tabs { display: flex; gap: 6px; padding: 4px 12px 8px; }
-  #tabs button { flex: 1; background: #1b1f27; color: #cfd3dc; border: 1px solid #2a2f3a; border-radius: 8px; padding: 9px 0; font-size: 14px; }
-  #tabs button.on { background: #2b6fe0; color: #fff; border-color: #2b6fe0; }
-  #wrap { position: relative; height: 52vh; min-height: 300px; margin: 0 6px; }
+  .warn { color: #f5c542; }
+  .dim { color: #787b86; }
+
+  #bar { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px 6px; background: #131722; border-bottom: 1px solid #2a2e39; }
+  #sym .s1 { font-size: 17px; font-weight: 700; letter-spacing: 0.3px; }
+  #sym .s2 { font-size: 11px; color: #787b86; margin-top: 1px; }
+  #pbox { text-align: right; }
+  #price { font-size: 22px; font-weight: 700; }
+  #live { font-size: 11px; margin-top: 1px; }
+
+  #tfs { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; background: #131722; border-bottom: 1px solid #2a2e39; }
+  #tfbtns button { background: transparent; border: none; color: #787b86; font-size: 14px; font-weight: 600; padding: 7px 11px; border-radius: 4px; }
+  #tfbtns button.on { color: #2962ff; background: rgba(41, 98, 255, 0.14); }
+  #tools button { background: transparent; border: 1px solid #2a2e39; color: #787b86; font-size: 12px; padding: 5px 9px; border-radius: 12px; margin-left: 5px; }
+  #tools button.on { color: #d1d4dc; border-color: #5d606b; background: #1e222d; }
+
+  #pages { position: relative; flex: 1; min-height: 0; }
+  .page { position: absolute; left: 0; top: 0; right: 0; bottom: 0; display: none; }
+  .page.on { display: block; }
+  .scroll { overflow-y: auto; -webkit-overflow-scrolling: touch; padding-bottom: 12px; }
+  #pChart { overflow: hidden; background: #131722; }
   #chart { position: absolute; left: 0; top: 0; right: 0; bottom: 0; }
   #ov { position: absolute; left: 0; top: 0; pointer-events: none; }
-  #msg { position: absolute; left: 0; right: 0; top: 45%; text-align: center; color: #8b93a3; pointer-events: none; }
-  #err { color: #ef5350; padding: 4px 12px; font-size: 12px; }
-  .card { background: #1b1f27; border-radius: 10px; padding: 12px; margin: 10px 12px; }
+  #legend { position: absolute; left: 8px; top: 6px; font-size: 12px; pointer-events: none; text-shadow: 0 0 4px #131722; z-index: 3; }
+  #legend b { font-weight: 600; margin-right: 6px; }
+  #float { position: absolute; left: 8px; top: 26px; pointer-events: none; z-index: 3; }
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin: 2px 4px 0 0; background: rgba(30, 34, 45, 0.88); border: 1px solid #2a2e39; }
+  #msg { position: absolute; left: 0; right: 0; top: 45%; text-align: center; color: #787b86; pointer-events: none; z-index: 3; }
+  #err { position: absolute; left: 8px; right: 8px; bottom: 6px; color: #ef5350; font-size: 12px; text-align: center; pointer-events: none; z-index: 4; }
+
+  #nav { display: flex; background: #1e222d; border-top: 1px solid #2a2e39; padding-bottom: env(safe-area-inset-bottom); }
+  #nav button { flex: 1; background: transparent; border: none; color: #787b86; padding: 8px 0 7px; font-size: 11px; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  #nav button span { font-size: 18px; line-height: 20px; }
+  #nav button.on { color: #2962ff; }
+
+  .card { background: #1e222d; border-radius: 10px; padding: 12px; margin: 10px 12px 0; border: 1px solid #2a2e39; }
   .card h3 { margin: 0 0 8px; font-size: 14px; color: #f5c542; }
-  .row { display: flex; justify-content: space-between; gap: 10px; padding: 5px 0; border-bottom: 1px solid #262b35; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid #2a2e39; }
   .row:last-child { border-bottom: none; }
   .row span:last-child { text-align: right; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { text-align: left; padding: 6px 4px; border-bottom: 1px solid #262b35; }
-  th { color: #8b93a3; font-weight: normal; }
-  .legend { font-size: 11px; color: #8b93a3; padding: 0 12px 6px; }
+  th, td { text-align: left; padding: 7px 4px; border-bottom: 1px solid #2a2e39; }
+  th { color: #787b86; font-weight: normal; }
+  .key { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 </style>
 </head>
 <body>
-<div id="top">
-  <div id="price">--</div>
-  <div id="chips"></div>
+<div id="app">
+  <div id="bar">
+    <div id="sym"><div class="s1">XAUUSD</div><div class="s2">Gold / US Dollar - Top-Down SMC</div></div>
+    <div id="pbox"><div id="price">--</div><div id="live" class="dim">connecting...</div></div>
+  </div>
+  <div id="tfs">
+    <div id="tfbtns">
+      <button class="tf on" data-tf="5m">5m</button>
+      <button class="tf" data-tf="15m">15m</button>
+      <button class="tf" data-tf="4h">4H</button>
+    </div>
+    <div id="tools">
+      <button id="tZones" class="on">Zones</button>
+      <button id="tMarks" class="on">Marks</button>
+    </div>
+  </div>
+  <div id="pages">
+    <div id="pChart" class="page on">
+      <div id="chart"></div>
+      <canvas id="ov"></canvas>
+      <div id="legend"></div>
+      <div id="float"></div>
+      <div id="msg">Loading candles...</div>
+    </div>
+    <div id="pAnalysis" class="page scroll"></div>
+    <div id="pSignals" class="page scroll"></div>
+    <div id="pData" class="page scroll"></div>
+    <div id="err"></div>
+  </div>
+  <div id="nav">
+    <button class="nb on" data-page="pChart"><span>&#128200;</span>Chart</button>
+    <button class="nb" data-page="pAnalysis"><span>&#129517;</span>Analysis</button>
+    <button class="nb" data-page="pSignals"><span>&#128680;</span><i id="sigLabel">Signals</i></button>
+    <button class="nb" data-page="pData"><span>&#128225;</span>Data</button>
+  </div>
 </div>
-<div id="tabs">
-  <button data-tf="5m" class="on">5M</button>
-  <button data-tf="15m">15M</button>
-  <button data-tf="4h">4H</button>
-</div>
-<div id="wrap">
-  <div id="chart"></div>
-  <canvas id="ov"></canvas>
-  <div id="msg">Loading candles...</div>
-</div>
-<div class="legend">Green box = 15M order block zone, yellow = 15M fair value gap, purple line = 4H 50% level, arrows = BOS / CHoCH and signals</div>
-<div id="err"></div>
-<div id="panel"></div>
 
 <script>
 (function () {
@@ -1260,11 +1302,16 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   var zones = [];
   var sig = "";
   var needFit = true;
+  var showZ = true;
+  var showM = true;
+  var lastPrice = null;
+  var lastBar = null;
 
   function $(id) { return document.getElementById(id); }
   function fmt(n) { return (n === null || n === undefined || isNaN(n)) ? "--" : Number(n).toFixed(2); }
   function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
   function hhmm(ms) { if (!ms) return "--"; return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+  function localHour(h) { return new Date(Date.UTC(2020, 0, 1, h, 0, 0)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
   function ago(ms) {
     if (!ms) return "never";
     var s = Math.round((Date.now() - ms) / 1000);
@@ -1276,7 +1323,9 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   function showErr(t) { $("err").textContent = t || ""; }
   function chip(txt, cls) { return '<span class="chip ' + (cls || "") + '">' + txt + '</span>'; }
   function row(a, b) { return '<div class="row"><span>' + a + '</span><span>' + b + '</span></div>'; }
+  function keyBox(color, txt) { return '<div class="row"><span><i class="key" style="background:' + color + '"></i>' + txt + '</span><span></span></div>'; }
 
+  // ---------------- chart library ----------------
   function loadLib(cb) {
     if (window.LightweightCharts) { cb(); return; }
     var urls = [
@@ -1295,30 +1344,49 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     next();
   }
 
+  function resizeChart() {
+    if (!chart) return;
+    var el = $("pChart");
+    if (el.clientWidth > 0 && el.clientHeight > 0) chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
+  }
+
+  function setLegend(c) {
+    if (!c) { $("legend").innerHTML = ""; return; }
+    var cls = c.close >= c.open ? "up" : "down";
+    $("legend").innerHTML = '<b>XAUUSD - ' + tf.toUpperCase() + '</b><span class="' + cls + '">O ' + fmt(c.open) + '  H ' + fmt(c.high) + '  L ' + fmt(c.low) + '  C ' + fmt(c.close) + '</span>';
+  }
+
   function initChart() {
-    var el = $("chart");
-    chart = LightweightCharts.createChart(el, {
+    var el = $("pChart");
+    chart = LightweightCharts.createChart($("chart"), {
       width: el.clientWidth,
       height: el.clientHeight,
-      layout: { background: { type: "solid", color: "#0f1115" }, textColor: "#cfd3dc" },
-      grid: { vertLines: { color: "#1b1f27" }, horzLines: { color: "#1b1f27" } },
-      rightPriceScale: { borderColor: "#2a2f3a" },
-      timeScale: { borderColor: "#2a2f3a", timeVisible: true, secondsVisible: false, rightOffset: 6 },
+      layout: { background: { type: "solid", color: "#131722" }, textColor: "#d1d4dc" },
+      grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
+      rightPriceScale: { borderColor: "#2a2e39" },
+      timeScale: { borderColor: "#2a2e39", timeVisible: true, secondsVisible: false, rightOffset: 6 },
       crosshair: { mode: 0 }
     });
     series = chart.addCandlestickSeries({
       upColor: "#26a69a", downColor: "#ef5350", borderVisible: false,
       wickUpColor: "#26a69a", wickDownColor: "#ef5350"
     });
-    window.addEventListener("resize", function () {
-      chart.applyOptions({ width: el.clientWidth, height: el.clientHeight });
-    });
+    if (chart.subscribeCrosshairMove) {
+      chart.subscribeCrosshairMove(function (p) {
+        var c = null;
+        if (p && p.seriesData && p.seriesData.get) c = p.seriesData.get(series);
+        setLegend(c || lastBar);
+      });
+    }
+    window.addEventListener("resize", resizeChart);
+    if (typeof ResizeObserver !== "undefined") new ResizeObserver(resizeChart).observe(el);
     if (data) render();
     loop();
   }
 
   function candlesOf() { return (data && data.candles && data.candles[tf]) || []; }
 
+  // ---------------- chart content ----------------
   function buildMarkers(cs) {
     var out = [];
     if (!cs.length) return out;
@@ -1341,7 +1409,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
         out.push({
           time: t0 / 1000 + TZ,
           position: s.dir === "BUY" ? "belowBar" : "aboveBar",
-          color: "#ffc107",
+          color: "#f5c542",
           shape: s.dir === "BUY" ? "arrowUp" : "arrowDown",
           text: s.dir
         });
@@ -1385,7 +1453,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       if (p.fvgTop !== null && p.fvgTop !== undefined) {
         zones.push({
           t1: p.obTime, t2: tEnd, top: p.fvgTop, bottom: p.fvgBottom,
-          fill: "rgba(255,193,7,0.18)", stroke: "#ffc107", label: "15M FVG"
+          fill: "rgba(245,197,66,0.18)", stroke: "#f5c542", label: "15M FVG"
         });
       }
     }
@@ -1408,6 +1476,14 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
         needFit = false;
       }
     }
+    if (cs.length) {
+      var lc = cs[cs.length - 1];
+      lastBar = { open: lc.o, high: lc.h, low: lc.l, close: lc.c };
+      setLegend(lastBar);
+    } else {
+      lastBar = null;
+      setLegend(null);
+    }
 
     for (var i = 0; i < plines.length; i++) series.removePriceLine(plines[i]);
     plines = [];
@@ -1418,7 +1494,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       }));
     }
     if (data.price) pl(data.price, "#ffffff", "live", 2);
-    if (data.htf && data.htf.eq) pl(data.htf.eq, "#b388ff", "4H 50%", 2);
+    if (showZ && data.htf && data.htf.eq) pl(data.htf.eq, "#b388ff", "4H 50%", 2);
     var openSig = null;
     for (var j = 0; j < data.signals.length; j++) {
       if (data.signals[j].status === "open") { openSig = data.signals[j]; break; }
@@ -1429,12 +1505,12 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       pl(openSig.tp, "#26a69a", "TP", 0);
     }
 
-    series.setMarkers(buildMarkers(cs));
+    series.setMarkers(showM ? buildMarkers(cs) : []);
     buildZones(cs);
   }
 
   function draw() {
-    var wrap = $("wrap");
+    var wrap = $("pChart");
     var cv = $("ov");
     var w = wrap.clientWidth;
     var h = wrap.clientHeight;
@@ -1442,7 +1518,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     if (cv.height !== h) cv.height = h;
     var ctx = cv.getContext("2d");
     ctx.clearRect(0, 0, w, h);
-    if (!chart || !series || !data) return;
+    if (!showZ || !chart || !series || !data || w === 0) return;
     var cs = candlesOf();
     if (!cs.length) return;
 
@@ -1484,22 +1560,44 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     requestAnimationFrame(loop);
   }
 
-  function renderPanel() {
+  // ---------------- text pages ----------------
+  function openSignalOf(d) {
+    for (var i = 0; i < d.signals.length; i++) if (d.signals[i].status === "open") return d.signals[i];
+    return null;
+  }
+
+  function renderTop() {
+    var d = data;
+    var h = d.htf;
+    var p = d.plan;
+    var s = d.status;
+
+    var pe = $("price");
+    pe.textContent = d.price ? fmt(d.price) : "--";
+    if (d.price && lastPrice !== null && d.price !== lastPrice) pe.className = d.price > lastPrice ? "up" : "down";
+    if (d.price) lastPrice = d.price;
+
+    $("live").innerHTML = s.marketClosed
+      ? '<span class="warn">Market closed</span>'
+      : '<span class="up">&#9679; LIVE</span> <span class="dim">' + hhmm(d.now) + '</span>';
+
+    var f = "";
+    if (h && h.bias) f += chip("4H " + h.bias.toUpperCase() + (h.zone ? " - " + h.zone : ""), h.bias === "bullish" ? "up" : "down");
+    else f += chip("4H bias unclear", "dim");
+    var os = openSignalOf(d);
+    if (os) f += chip("Signal open: " + os.dir, "warn");
+    else if (p) f += chip("Watching " + (p.dir === "bullish" ? "buy" : "sell") + " zone " + fmt(p.zoneBottom) + "-" + fmt(p.zoneTop), "warn");
+    else f += chip("Searching for a 15M setup", "dim");
+    $("float").innerHTML = f;
+
+    $("sigLabel").textContent = os ? "Signals \u25CF" : "Signals";
+  }
+
+  function renderAnalysis() {
     var d = data;
     var h = d.htf;
     var p = d.plan;
     var pr = d.progress;
-    var s = d.status;
-
-    $("price").textContent = d.price ? fmt(d.price) : "--";
-
-    var chips = chip("&#9679; LIVE " + hhmm(d.now), "up");
-    if (h && h.bias) chips += chip("4H " + h.bias.toUpperCase(), h.bias === "bullish" ? "up" : "down");
-    else chips += chip("4H bias unclear", "dim");
-    if (h && h.zone) chips += chip(h.zone.toUpperCase(), h.zone === "discount" ? "up" : "down");
-    chips += chip(s.marketClosed ? "Market closed" : "Market open", s.marketClosed ? "warn" : "up");
-    chips += chip(s.session ? "Signal hours" : "Outside signal hours", s.session ? "up" : "dim");
-    $("chips").innerHTML = chips;
 
     var html = '<div class="card"><h3>Top-down check</h3>';
 
@@ -1532,20 +1630,43 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     }
     html += '</div>';
 
-    var openSig = null;
-    for (var i = 0; i < d.signals.length; i++) {
-      if (d.signals[i].status === "open") { openSig = d.signals[i]; break; }
-    }
-    if (openSig) {
+    html += '<div class="card"><h3>How to read the chart</h3>';
+    html += keyBox("#26a69a", "Green box: 15M buy zone (order block)");
+    html += keyBox("#ef5350", "Red box: 15M sell zone (order block)");
+    html += keyBox("#f5c542", "Yellow box: 15M fair value gap");
+    html += keyBox("#b388ff", "Purple line: 4H 50% level (above = premium, below = discount)");
+    html += keyBox("#ffffff", "White dashed line: live price");
+    html += keyBox("#787b86", "Arrows: BOS / CHoCH structure breaks and signals");
+    html += '</div>';
+
+    $("pAnalysis").innerHTML = html;
+  }
+
+  function renderSignals() {
+    var d = data;
+    var s = d.status;
+    var os = openSignalOf(d);
+    var html = "";
+
+    if (os) {
       html += '<div class="card"><h3>Open signal</h3>';
-      html += row("Direction", '<b class="' + (openSig.dir === "BUY" ? "up" : "down") + '">' + openSig.dir + '</b>');
-      html += row("Entry", fmt(openSig.entry));
-      html += row("Stop loss", fmt(openSig.sl));
-      html += row("Take profit", fmt(openSig.tp));
+      html += row("Direction", '<b class="' + (os.dir === "BUY" ? "up" : "down") + '">' + os.dir + '</b>');
+      html += row("Entry", fmt(os.entry));
+      html += row("Stop loss", fmt(os.sl));
+      html += row("Take profit", fmt(os.tp));
+      html += row("Opened", new Date(os.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
       html += '</div>';
     }
 
-    html += '<div class="card"><h3>Recent signals (' + s.wins + ' wins / ' + s.losses + ' losses)</h3>';
+    var done = s.wins + s.losses;
+    var rate = done ? Math.round((s.wins / done) * 100) + "%" : "--";
+    html += '<div class="card"><h3>Results</h3>';
+    html += row("Wins", '<span class="up">' + s.wins + '</span>');
+    html += row("Losses", '<span class="down">' + s.losses + '</span>');
+    html += row("Win rate (finished trades)", rate);
+    html += '</div>';
+
+    html += '<div class="card"><h3>Recent signals</h3>';
     if (d.signals.length) {
       html += '<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Result</th></tr>';
       d.signals.forEach(function (x) {
@@ -1554,21 +1675,43 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       });
       html += '</table>';
     } else {
-      html += '<span class="dim">No signals yet.</span>';
+      html += '<span class="dim">No signals yet. The bot only signals when all three timeframes line up, so this can take a while.</span>';
     }
     html += '</div>';
 
-    html += '<div class="card"><h3>Data</h3>';
+    $("pSignals").innerHTML = html;
+  }
+
+  function renderData() {
+    var d = data;
+    var s = d.status;
+    var html = '<div class="card"><h3>Data feed</h3>';
     html += row("Status", esc(s.dataStatus));
+    html += row("Market", s.marketClosed ? '<span class="warn">closed</span>' : '<span class="up">open</span>');
     html += row("5M candles updated", ago(s.lastFetch["5m"]));
     html += row("15M candles updated", ago(s.lastFetch["15m"]));
     html += row("4H candles updated", ago(s.lastFetch["4h"]));
     html += row("Twelve Data credits used today", s.creditsUsed + " / 800");
     html += '</div>';
 
-    $("panel").innerHTML = html;
+    html += '<div class="card"><h3>Strategy</h3>';
+    html += row("Flow", "4H bias &#8594; 15M zone &#8594; 5M entry");
+    html += row("Minimum reward : risk", "1 : 2");
+    html += row("Signal hours", localHour(7) + " - " + localHour(20) + " (your time)");
+    html += row("One signal at a time", "yes");
+    html += '</div>';
+
+    $("pData").innerHTML = html;
   }
 
+  function renderPanel() {
+    renderTop();
+    renderAnalysis();
+    renderSignals();
+    renderData();
+  }
+
+  // ---------------- data polling ----------------
   function poll() {
     fetch("/api/panel", { credentials: "same-origin", cache: "no-store" })
       .then(function (r) {
@@ -1586,16 +1729,46 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       });
   }
 
-  var btns = document.querySelectorAll("#tabs button");
-  for (var b = 0; b < btns.length; b++) {
-    btns[b].onclick = function () {
+  // ---------------- controls ----------------
+  function showPage(id) {
+    var pgs = document.querySelectorAll(".page");
+    for (var i = 0; i < pgs.length; i++) {
+      pgs[i].className = (pgs[i].id === "pChart" ? "page" : "page scroll") + (pgs[i].id === id ? " on" : "");
+    }
+    var nbs = document.querySelectorAll("#nav button");
+    for (var k = 0; k < nbs.length; k++) {
+      nbs[k].className = "nb" + (nbs[k].getAttribute("data-page") === id ? " on" : "");
+    }
+    $("tfs").style.display = id === "pChart" ? "flex" : "none";
+    if (id === "pChart") setTimeout(resizeChart, 30);
+  }
+
+  var nbs0 = document.querySelectorAll("#nav button");
+  for (var a = 0; a < nbs0.length; a++) {
+    nbs0[a].onclick = function () { showPage(this.getAttribute("data-page")); };
+  }
+
+  var tfb = document.querySelectorAll("#tfbtns button");
+  for (var b = 0; b < tfb.length; b++) {
+    tfb[b].onclick = function () {
       tf = this.getAttribute("data-tf");
-      for (var k = 0; k < btns.length; k++) btns[k].className = btns[k] === this ? "on" : "";
+      for (var k = 0; k < tfb.length; k++) tfb[k].className = tfb[k] === this ? "tf on" : "tf";
       needFit = true;
       sig = "";
       render();
     };
   }
+
+  $("tZones").onclick = function () {
+    showZ = !showZ;
+    this.className = showZ ? "on" : "";
+    render();
+  };
+  $("tMarks").onclick = function () {
+    showM = !showM;
+    this.className = showM ? "on" : "";
+    render();
+  };
 
   poll();
   setInterval(poll, 15000);
