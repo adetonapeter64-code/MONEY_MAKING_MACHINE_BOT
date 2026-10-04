@@ -1022,6 +1022,190 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
 });
 
 // ================================================================
+// ON-DEMAND CHART DATA  (any pair, any timeframe - chart only)
+// XAU/USD on 5m / 15m / 4H comes from the bot's own data (no credits).
+// Everything else is fetched when you open it and cached, with a
+// daily cap so it can never use up the Twelve Data credits.
+// ================================================================
+
+const CHART_TFS = {
+  "1m":  { interval: "1min",  ms: 60 * 1000 },
+  "5m":  { interval: "5min",  ms: 5 * 60 * 1000 },
+  "15m": { interval: "15min", ms: 15 * 60 * 1000 },
+  "30m": { interval: "30min", ms: 30 * 60 * 1000 },
+  "1h":  { interval: "1h",    ms: 60 * 60 * 1000 },
+  "4h":  { interval: "4h",    ms: 4 * 60 * 60 * 1000 },
+  "1d":  { interval: "1day",  ms: 24 * 60 * 60 * 1000 },
+  "1w":  { interval: "1week", ms: 7 * 24 * 60 * 60 * 1000 }
+};
+
+const ONDEMAND_DAILY_CAP = 200; // extra chart loads per day (1 credit each)
+const ONDEMAND_BARS = 300;
+const CHART_CACHE_MAX = 60;
+
+const chartCache = new Map();    // "SYMBOL|tf" -> { at, candles }
+const chartInflight = new Map(); // "SYMBOL|tf" -> promise
+let onDemandUsed = 0;
+let onDemandDay = new Date().getUTCDate();
+
+function rolloverOnDemand() {
+  const d = new Date().getUTCDate();
+  if (d !== onDemandDay) {
+    onDemandDay = d;
+    onDemandUsed = 0;
+  }
+}
+
+function packCandles(arr) {
+  return (arr || []).map(c => ({ t: c.t, o: c.open, h: c.high, l: c.low, c: c.close }));
+}
+
+// How long a loaded chart is reused before it is fetched again
+function chartTtl(tf) {
+  return Math.min(Math.max(CHART_TFS[tf].ms, 60 * 1000), 60 * 60 * 1000);
+}
+
+async function fetchOnDemand(symbol, tf) {
+  const cfg = CHART_TFS[tf];
+
+  const res = await axios.get("https://api.twelvedata.com/time_series", {
+    params: {
+      symbol,
+      interval: cfg.interval,
+      outputsize: ONDEMAND_BARS,
+      order: "asc",
+      timezone: "UTC",
+      apikey: TD_KEY
+    },
+    timeout: 15000
+  });
+
+  creditsUsed++;
+  onDemandUsed++;
+
+  const d = res.data;
+
+  if (!d || d.status === "error" || !Array.isArray(d.values)) {
+    const err = new Error((d && d.message) || "Bad response from Twelve Data");
+    err.apiCode = d && d.code;
+    throw err;
+  }
+
+  const now = Date.now();
+
+  return d.values
+    .map(v => {
+      const raw = String(v.datetime);
+      const iso = raw.length <= 10 ? raw + "T00:00:00Z" : raw.replace(" ", "T") + "Z";
+      return {
+        t: Date.parse(iso),
+        open: Number(v.open),
+        high: Number(v.high),
+        low: Number(v.low),
+        close: Number(v.close)
+      };
+    })
+    .filter(c =>
+      Number.isFinite(c.t) &&
+      Number.isFinite(c.open) && Number.isFinite(c.high) &&
+      Number.isFinite(c.low) && Number.isFinite(c.close) &&
+      c.t + cfg.ms <= now + 2000          // drop the candle that is still forming
+    );
+}
+
+app.get("/api/chart", requireAdminAuth, async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    rolloverOnDemand();
+
+    const symbol = String(req.query.symbol || SYMBOL).toUpperCase().trim();
+    const tf = String(req.query.tf || "5m").toLowerCase().trim();
+
+    if (!/^[A-Z]{2,6}\/[A-Z]{2,6}$/.test(symbol)) {
+      return res.json({ error: "Use a pair like EUR/USD.", candles: [] });
+    }
+    if (!CHART_TFS[tf]) {
+      return res.json({ error: "Unknown timeframe.", candles: [] });
+    }
+
+    const usage = { onDemandUsed, onDemandCap: ONDEMAND_DAILY_CAP, creditsUsed };
+
+    // 1) the bot's own candles - free
+    if (symbol === SYMBOL && candles[tf] && candles[tf].length) {
+      return res.json({
+        symbol, tf, source: "bot",
+        candles: packCandles(candles[tf]),
+        fetchedAt: lastFetchOk[tf] || Date.now(),
+        usage
+      });
+    }
+
+    // 2) recently loaded - free
+    const key = symbol + "|" + tf;
+    const hit = chartCache.get(key);
+
+    if (hit && Date.now() - hit.at < chartTtl(tf)) {
+      return res.json({ symbol, tf, source: "cache", candles: packCandles(hit.candles), fetchedAt: hit.at, usage });
+    }
+
+    // 3) needs a Twelve Data credit
+    const stale = note => {
+      if (hit) {
+        return res.json({ symbol, tf, source: "stale", candles: packCandles(hit.candles), fetchedAt: hit.at, note, usage });
+      }
+      return res.json({ error: note, candles: [], usage });
+    };
+
+    if (!TD_KEY) return stale("No Twelve Data key is set in Render.");
+    if (Date.now() < pausedUntil) return stale("Twelve Data is paused: " + dataStatus);
+    if (onDemandUsed >= ONDEMAND_DAILY_CAP) {
+      return stale("Extra chart limit reached today (" + ONDEMAND_DAILY_CAP + " loads). It resets at 00:00 UTC.");
+    }
+    if (creditsUsed >= DAILY_CREDIT_LIMIT) {
+      return stale("Twelve Data credit safety limit reached for today.");
+    }
+
+    let p = chartInflight.get(key);
+    if (!p) {
+      p = fetchOnDemand(symbol, tf).finally(() => chartInflight.delete(key));
+      chartInflight.set(key, p);
+    }
+
+    try {
+      const list = await p;
+
+      chartCache.set(key, { at: Date.now(), candles: list });
+      if (chartCache.size > CHART_CACHE_MAX) {
+        chartCache.delete(chartCache.keys().next().value);
+      }
+
+      return res.json({
+        symbol, tf, source: "live",
+        candles: packCandles(list),
+        fetchedAt: Date.now(),
+        usage: { onDemandUsed, onDemandCap: ONDEMAND_DAILY_CAP, creditsUsed }
+      });
+
+    } catch (e) {
+      const body = e.response && e.response.data;
+      const msg = String((body && body.message) || e.message || "Could not load this chart").slice(0, 160);
+      const code = Number((body && body.code) || e.apiCode || (e.response && e.response.status));
+
+      // only quota / key problems should pause the whole bot
+      if (code === 429 || code === 401 || code === 403 || /credits/i.test(msg)) {
+        handleDataError(e);
+      }
+
+      return stale(msg);
+    }
+
+  } catch (e) {
+    res.status(500).json({ error: e.message, candles: [] });
+  }
+});
+
+
+// ================================================================
 // LIVE PANEL  -  open  your-bot-url/panel  (same login as /admin)
 // Shows the candles and the top-down SMC read-out of the bot.
 // ================================================================
@@ -1168,6 +1352,8 @@ async function buildPanelData() {
       session: !SESSION_FILTER || (hr >= SESSION_START_UTC && hr < SESSION_END_UTC),
       dataStatus,
       creditsUsed,
+      onDemandUsed,
+      onDemandCap: ONDEMAND_DAILY_CAP,
       paused: Date.now() < pausedUntil,
       lastFetch: {
         "5m": lastFetchOk["5m"] || 0,
@@ -1208,24 +1394,30 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   .down { color: #ef5350; }
   .warn { color: #f5c542; }
   .dim { color: #787b86; }
+  .small { font-size: 12px; }
 
   #bar { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px 6px; background: #131722; border-bottom: 1px solid #2a2e39; }
-  #sym .s1 { font-size: 17px; font-weight: 700; letter-spacing: 0.3px; }
-  #sym .s2 { font-size: 11px; color: #787b86; margin-top: 1px; }
+  #symWrap { position: relative; }
+  #symSel { background: transparent; color: #d1d4dc; border: none; font-size: 17px; font-weight: 700; padding: 0 16px 0 0; margin: 0; -webkit-appearance: none; appearance: none; outline: none; max-width: 150px; }
+  #symWrap:after { content: "\25BE"; position: absolute; right: 0; top: 2px; color: #787b86; pointer-events: none; }
+  #symSub { font-size: 11px; color: #787b86; margin-top: 1px; }
   #pbox { text-align: right; }
   #price { font-size: 22px; font-weight: 700; }
   #live { font-size: 11px; margin-top: 1px; }
 
-  #tfs { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; background: #131722; border-bottom: 1px solid #2a2e39; }
-  #tfbtns button { background: transparent; border: none; color: #787b86; font-size: 14px; font-weight: 600; padding: 7px 11px; border-radius: 4px; }
+  #tfs { display: flex; align-items: center; justify-content: space-between; padding: 4px 6px; background: #131722; border-bottom: 1px solid #2a2e39; }
+  #tfbtns { display: flex; overflow-x: auto; flex: 1; -webkit-overflow-scrolling: touch; }
+  #tfbtns::-webkit-scrollbar { display: none; }
+  #tfbtns button { background: transparent; border: none; color: #787b86; font-size: 14px; font-weight: 600; padding: 7px 10px; border-radius: 4px; flex: 0 0 auto; }
   #tfbtns button.on { color: #2962ff; background: rgba(41, 98, 255, 0.14); }
-  #tools button { background: transparent; border: 1px solid #2a2e39; color: #787b86; font-size: 12px; padding: 5px 9px; border-radius: 12px; margin-left: 5px; }
+  #tools { display: flex; flex: 0 0 auto; }
+  #tools button { background: transparent; border: 1px solid #2a2e39; color: #787b86; font-size: 12px; padding: 5px 8px; border-radius: 12px; margin-left: 4px; }
   #tools button.on { color: #d1d4dc; border-color: #5d606b; background: #1e222d; }
 
   #pages { position: relative; flex: 1; min-height: 0; }
   .page { position: absolute; left: 0; top: 0; right: 0; bottom: 0; display: none; }
   .page.on { display: block; }
-  .scroll { overflow-y: auto; -webkit-overflow-scrolling: touch; padding-bottom: 12px; }
+  .scroll { overflow-y: auto; -webkit-overflow-scrolling: touch; padding-bottom: 14px; }
   #pChart { overflow: hidden; background: #131722; }
   #chart { position: absolute; left: 0; top: 0; right: 0; bottom: 0; }
   #ov { position: absolute; left: 0; top: 0; pointer-events: none; }
@@ -1233,37 +1425,48 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   #legend b { font-weight: 600; margin-right: 6px; }
   #float { position: absolute; left: 8px; top: 26px; pointer-events: none; z-index: 3; }
   .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin: 2px 4px 0 0; background: rgba(30, 34, 45, 0.88); border: 1px solid #2a2e39; }
-  #msg { position: absolute; left: 0; right: 0; top: 45%; text-align: center; color: #787b86; pointer-events: none; z-index: 3; }
+  #msg { position: absolute; left: 12px; right: 12px; top: 45%; text-align: center; color: #787b86; pointer-events: none; z-index: 3; }
   #err { position: absolute; left: 8px; right: 8px; bottom: 6px; color: #ef5350; font-size: 12px; text-align: center; pointer-events: none; z-index: 4; }
 
   #nav { display: flex; background: #1e222d; border-top: 1px solid #2a2e39; padding-bottom: env(safe-area-inset-bottom); }
-  #nav button { flex: 1; background: transparent; border: none; color: #787b86; padding: 8px 0 7px; font-size: 11px; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  #nav button { flex: 1; background: transparent; border: none; color: #787b86; padding: 8px 0 7px; font-size: 10.5px; display: flex; flex-direction: column; align-items: center; gap: 2px; }
   #nav button span { font-size: 18px; line-height: 20px; }
+  #nav button i { font-style: normal; }
   #nav button.on { color: #2962ff; }
 
   .card { background: #1e222d; border-radius: 10px; padding: 12px; margin: 10px 12px 0; border: 1px solid #2a2e39; }
   .card h3 { margin: 0 0 8px; font-size: 14px; color: #f5c542; }
-  .row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid #2a2e39; }
+  .card p { margin: 0 0 8px; }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 7px 0; border-bottom: 1px solid #2a2e39; }
   .row:last-child { border-bottom: none; }
   .row span:last-child { text-align: right; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 7px 4px; border-bottom: 1px solid #2a2e39; }
   th { color: #787b86; font-weight: normal; }
   .key { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  .txt, .num { background: #131722; color: #d1d4dc; border: 1px solid #2a2e39; border-radius: 6px; padding: 6px 8px; font-size: 14px; }
+  .num { width: 64px; margin-left: 4px; }
+  .txt { width: 150px; }
+  .btn, .mini { background: #2962ff; color: #fff; border: none; border-radius: 6px; padding: 8px 12px; font-size: 13px; margin-right: 6px; }
+  .mini { padding: 5px 9px; font-size: 12px; background: #2a2e39; color: #d1d4dc; margin: 0; }
+  .btn.gray { background: #2a2e39; color: #d1d4dc; }
+  textarea.code { width: 100%; background: #0e1118; color: #d1d4dc; border: 1px solid #2a2e39; border-radius: 6px; padding: 8px; font-family: Menlo, Consolas, monospace; font-size: 12px; margin: 6px 0; }
+  .lbl { display: flex; align-items: center; gap: 8px; }
+  .lbl input { width: 18px; height: 18px; }
 </style>
 </head>
 <body>
 <div id="app">
   <div id="bar">
-    <div id="sym"><div class="s1">XAUUSD</div><div class="s2">Gold / US Dollar - Top-Down SMC</div></div>
+    <div>
+      <div id="symWrap"><select id="symSel"></select></div>
+      <div id="symSub">Top-Down SMC</div>
+    </div>
     <div id="pbox"><div id="price">--</div><div id="live" class="dim">connecting...</div></div>
   </div>
   <div id="tfs">
-    <div id="tfbtns">
-      <button class="tf on" data-tf="5m">5m</button>
-      <button class="tf" data-tf="15m">15m</button>
-      <button class="tf" data-tf="4h">4H</button>
-    </div>
+    <div id="tfbtns"></div>
     <div id="tools">
       <button id="tZones" class="on">Zones</button>
       <button id="tMarks" class="on">Marks</button>
@@ -1279,37 +1482,69 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     </div>
     <div id="pAnalysis" class="page scroll"></div>
     <div id="pSignals" class="page scroll"></div>
-    <div id="pData" class="page scroll"></div>
+    <div id="pInd" class="page scroll"></div>
+    <div id="pSet" class="page scroll"></div>
     <div id="err"></div>
   </div>
   <div id="nav">
     <button class="nb on" data-page="pChart"><span>&#128200;</span>Chart</button>
     <button class="nb" data-page="pAnalysis"><span>&#129517;</span>Analysis</button>
     <button class="nb" data-page="pSignals"><span>&#128680;</span><i id="sigLabel">Signals</i></button>
-    <button class="nb" data-page="pData"><span>&#128225;</span>Data</button>
+    <button class="nb" data-page="pInd"><span>&#128202;</span>Indicators</button>
+    <button class="nb" data-page="pSet"><span>&#9881;&#65039;</span>Settings</button>
   </div>
 </div>
 
 <script>
 (function () {
+  var MS = { "1m": 60000, "5m": 300000, "15m": 900000, "30m": 1800000, "1h": 3600000, "4h": 14400000, "1d": 86400000, "1w": 604800000 };
+  var TFS = [["1m", "1m"], ["5m", "5m"], ["15m", "15m"], ["30m", "30m"], ["1h", "1h"], ["4h", "4H"], ["1d", "1D"], ["1w", "1W"]];
+  var GOLD = "XAU/USD";
+  var DEF_PAIRS = ["XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY", "XAG/USD", "BTC/USD", "ETH/USD"];
+  var IND_DEF = {
+    sma: { on: false, p: 50, name: "SMA" },
+    ema1: { on: false, p: 20, name: "EMA 1" },
+    ema2: { on: false, p: 50, name: "EMA 2" },
+    bb: { on: false, p: 20, m: 2, name: "Bollinger Bands" },
+    rsi: { on: false, p: 14, name: "RSI (separate pane)" },
+    macd: { on: false, f: 12, s: 26, g: 9, name: "MACD (separate pane)" }
+  };
+  var IND_ORDER = ["sma", "ema1", "ema2", "bb", "rsi", "macd"];
+  var IND_FIELDS = {
+    sma: [["p", "period"]],
+    ema1: [["p", "period"]],
+    ema2: [["p", "period"]],
+    bb: [["p", "period"], ["m", "dev"]],
+    rsi: [["p", "period"]],
+    macd: [["f", "fast"], ["s", "slow"], ["g", "signal"]]
+  };
+  var EXAMPLE = "// Example: two EMAs drawn on the chart\nreturn {\n  lines: [ta.ema(c, 9), ta.ema(c, 21)],\n  colors: ['#26a69a', '#ef5350']\n};";
+
   var TZ = -new Date().getTimezoneOffset() * 60;
-  var MS = { "5m": 300000, "15m": 900000, "4h": 14400000 };
-  var tf = "5m";
-  var data = null;
+  var cfg = loadCfg();
+  var botData = null;
+  var cur = { candles: [] };
   var chart = null;
   var series = null;
   var plines = [];
   var zones = [];
+  var indSeries = [];
   var sig = "";
+  var indSig = "";
   var needFit = true;
-  var showZ = true;
-  var showM = true;
+  var reqId = 0;
+  var tick = 0;
   var lastPrice = null;
   var lastBar = null;
 
   function $(id) { return document.getElementById(id); }
-  function fmt(n) { return (n === null || n === undefined || isNaN(n)) ? "--" : Number(n).toFixed(2); }
   function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function num(n) { return (n === null || n === undefined || isNaN(n)) ? "--" : Number(n).toFixed(2); }
+  function precisionFor(p) { return p >= 500 ? 2 : (p >= 20 ? 3 : 5); }
+  function fmt(n) {
+    if (n === null || n === undefined || isNaN(n)) return "--";
+    return Number(n).toFixed(precisionFor(Math.abs(n)));
+  }
   function hhmm(ms) { if (!ms) return "--"; return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
   function localHour(h) { return new Date(Date.UTC(2020, 0, 1, h, 0, 0)).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
   function ago(ms) {
@@ -1324,6 +1559,119 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   function chip(txt, cls) { return '<span class="chip ' + (cls || "") + '">' + txt + '</span>'; }
   function row(a, b) { return '<div class="row"><span>' + a + '</span><span>' + b + '</span></div>'; }
   function keyBox(color, txt) { return '<div class="row"><span><i class="key" style="background:' + color + '"></i>' + txt + '</span><span></span></div>'; }
+
+  // ---------------- saved settings (kept in this browser) ----------------
+  function loadCfg() {
+    var c = null;
+    try { c = JSON.parse(localStorage.getItem("mmm_cfg") || "null"); } catch (e) { c = null; }
+    c = c || {};
+    if (!c.pairs || !c.pairs.length) c.pairs = DEF_PAIRS.slice();
+    if (!c.symbol) c.symbol = GOLD;
+    if (!MS[c.tf]) c.tf = "5m";
+    c.ind = c.ind || {};
+    for (var k in IND_DEF) {
+      var d = {};
+      for (var f in IND_DEF[k]) d[f] = IND_DEF[k][f];
+      var s = c.ind[k] || {};
+      for (var g in s) d[g] = s[g];
+      d.name = IND_DEF[k].name;
+      c.ind[k] = d;
+    }
+    c.custom = c.custom || { code: "", on: false };
+    c.zones = c.zones !== false;
+    c.marks = c.marks !== false;
+    return c;
+  }
+  function saveCfg() { try { localStorage.setItem("mmm_cfg", JSON.stringify(cfg)); } catch (e) { } }
+
+  // ---------------- indicator maths (also available in the code box as "ta") ----------------
+  var ta = {
+    sma: function (a, p) {
+      var out = [], s = 0;
+      for (var i = 0; i < a.length; i++) {
+        s += a[i];
+        if (i >= p) s -= a[i - p];
+        out.push(i >= p - 1 ? s / p : null);
+      }
+      return out;
+    },
+    ema: function (a, p) {
+      var k = 2 / (p + 1), out = [], e = null, cnt = 0;
+      for (var i = 0; i < a.length; i++) {
+        var v = a[i];
+        if (v === null || v === undefined || isNaN(v)) { out.push(null); continue; }
+        cnt++;
+        e = (e === null) ? v : v * k + e * (1 - k);
+        out.push(cnt >= p ? e : null);
+      }
+      return out;
+    },
+    stdev: function (a, p) {
+      var out = [];
+      for (var i = 0; i < a.length; i++) {
+        if (i < p - 1) { out.push(null); continue; }
+        var m = 0, j;
+        for (j = i - p + 1; j <= i; j++) m += a[j];
+        m /= p;
+        var v = 0;
+        for (j = i - p + 1; j <= i; j++) v += (a[j] - m) * (a[j] - m);
+        out.push(Math.sqrt(v / p));
+      }
+      return out;
+    },
+    highest: function (a, p) {
+      var out = [];
+      for (var i = 0; i < a.length; i++) {
+        if (i < p - 1) { out.push(null); continue; }
+        var m = a[i];
+        for (var j = i - p + 1; j < i; j++) if (a[j] > m) m = a[j];
+        out.push(m);
+      }
+      return out;
+    },
+    lowest: function (a, p) {
+      var out = [];
+      for (var i = 0; i < a.length; i++) {
+        if (i < p - 1) { out.push(null); continue; }
+        var m = a[i];
+        for (var j = i - p + 1; j < i; j++) if (a[j] < m) m = a[j];
+        out.push(m);
+      }
+      return out;
+    },
+    rsi: function (a, p) {
+      var out = [], g = 0, l = 0;
+      for (var i = 0; i < a.length; i++) {
+        if (i === 0) { out.push(null); continue; }
+        var d = a[i] - a[i - 1];
+        var up = d > 0 ? d : 0;
+        var dn = d < 0 ? -d : 0;
+        if (i <= p) {
+          g += up; l += dn;
+          if (i === p) {
+            g /= p; l /= p;
+            out.push(l === 0 ? 100 : 100 - 100 / (1 + g / l));
+          } else out.push(null);
+        } else {
+          g = (g * (p - 1) + up) / p;
+          l = (l * (p - 1) + dn) / p;
+          out.push(l === 0 ? 100 : 100 - 100 / (1 + g / l));
+        }
+      }
+      return out;
+    },
+    atr: function (hh, ll, cc, p) {
+      var out = [], a = 0;
+      for (var i = 0; i < cc.length; i++) {
+        var tr = i === 0 ? hh[i] - ll[i] : Math.max(hh[i] - ll[i], Math.abs(hh[i] - cc[i - 1]), Math.abs(ll[i] - cc[i - 1]));
+        if (i < p - 1) { out.push(null); a += tr; continue; }
+        if (i === p - 1) { a = (a + tr) / p; out.push(a); continue; }
+        a = (a * (p - 1) + tr) / p;
+        out.push(a);
+      }
+      return out;
+    }
+  };
 
   // ---------------- chart library ----------------
   function loadLib(cb) {
@@ -1353,7 +1701,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   function setLegend(c) {
     if (!c) { $("legend").innerHTML = ""; return; }
     var cls = c.close >= c.open ? "up" : "down";
-    $("legend").innerHTML = '<b>XAUUSD - ' + tf.toUpperCase() + '</b><span class="' + cls + '">O ' + fmt(c.open) + '  H ' + fmt(c.high) + '  L ' + fmt(c.low) + '  C ' + fmt(c.close) + '</span>';
+    $("legend").innerHTML = '<b>' + esc(cfg.symbol) + ' - ' + cfg.tf.toUpperCase() + '</b><span class="' + cls + '">O ' + fmt(c.open) + '  H ' + fmt(c.high) + '  L ' + fmt(c.low) + '  C ' + fmt(c.close) + '</span>';
   }
 
   function initChart() {
@@ -1380,19 +1728,66 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     }
     window.addEventListener("resize", resizeChart);
     if (typeof ResizeObserver !== "undefined") new ResizeObserver(resizeChart).observe(el);
-    if (data) render();
+    render();
     loop();
   }
 
-  function candlesOf() { return (data && data.candles && data.candles[tf]) || []; }
+  // ---------------- data ----------------
+  function isGold() { return cfg.symbol === GOLD; }
+  function usingBot() {
+    return isGold() && botData && botData.candles && botData.candles[cfg.tf] && botData.candles[cfg.tf].length > 0;
+  }
+  function candlesOf() {
+    if (usingBot()) return botData.candles[cfg.tf];
+    if (cur.symbol === cfg.symbol && cur.tf === cfg.tf) return cur.candles || [];
+    return [];
+  }
+
+  function loadChart() {
+    if (usingBot()) return;
+    var s = cfg.symbol;
+    var t = cfg.tf;
+    var my = ++reqId;
+    fetch("/api/chart?symbol=" + encodeURIComponent(s) + "&tf=" + t, { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (my !== reqId) return;
+        cur = { symbol: s, tf: t, candles: j.candles || [], error: j.error || "", note: j.note || "", source: j.source || "", fetchedAt: j.fetchedAt || 0, usage: j.usage || null };
+        showErr(j.error || j.note || "");
+        render();
+        renderTop();
+        renderSettingsData();
+      })
+      .catch(function (e) {
+        if (my !== reqId) return;
+        showErr("Connection problem: " + e.message + " (retrying)");
+      });
+  }
+
+  function pollBot() {
+    fetch("/api/panel", { credentials: "same-origin", cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
+      .then(function (j) {
+        botData = j;
+        if (usingBot()) showErr("");
+        render();
+        renderPanel();
+      })
+      .catch(function (e) {
+        showErr("Connection problem: " + e.message + " (retrying)");
+      });
+  }
 
   // ---------------- chart content ----------------
   function buildMarkers(cs) {
     var out = [];
-    if (!cs.length) return out;
+    if (!cs.length || !botData || !isGold()) return out;
     var first = cs[0].t;
     var last = cs[cs.length - 1].t;
-    var br = (data.structure && data.structure[tf]) || [];
+    var br = (botData.structure && botData.structure[cfg.tf]) || [];
     br.forEach(function (b) {
       if (b.t < first || b.t > last) return;
       out.push({
@@ -1403,8 +1798,9 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
         text: b.type
       });
     });
-    data.signals.forEach(function (s) {
-      var t0 = Math.floor(s.time / MS[tf]) * MS[tf];
+    botData.signals.forEach(function (s) {
+      var m = MS[cfg.tf];
+      var t0 = Math.floor(s.time / m) * m;
       if (t0 >= first && t0 <= last) {
         out.push({
           time: t0 / 1000 + TZ,
@@ -1415,7 +1811,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
         });
       }
       if (s.closedAt) {
-        var t1 = Math.floor(s.closedAt / MS[tf]) * MS[tf];
+        var t1 = Math.floor(s.closedAt / m) * m;
         if (t1 >= first && t1 <= last) {
           out.push({
             time: t1 / 1000 + TZ,
@@ -1433,15 +1829,15 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
 
   function buildZones(cs) {
     zones = [];
-    if (!cs.length) return;
+    if (!cs.length || !botData || !isGold()) return;
     var firstT = cs[0].t;
-    var tEnd = cs[cs.length - 1].t + MS[tf] * 60;
-    var h = data.htf;
+    var tEnd = cs[cs.length - 1].t + MS[cfg.tf] * 60;
+    var h = botData.htf;
     if (h && h.eq) {
       zones.push({ t1: firstT, t2: tEnd, top: h.rangeHigh, bottom: h.eq, fill: "rgba(239,83,80,0.07)", stroke: null, label: "PREMIUM" });
       zones.push({ t1: firstT, t2: tEnd, top: h.eq, bottom: h.rangeLow, fill: "rgba(38,166,154,0.07)", stroke: null, label: "DISCOUNT" });
     }
-    var p = data.plan;
+    var p = botData.plan;
     if (p) {
       var buy = p.dir === "bullish";
       zones.push({
@@ -1459,14 +1855,148 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     }
   }
 
+  // ---------------- indicators ----------------
+  function setCErr(t) { var e = $("cErr"); if (e) e.textContent = t || ""; }
+
+  function clearInd() {
+    for (var i = 0; i < indSeries.length; i++) {
+      try { chart.removeSeries(indSeries[i]); } catch (e) { }
+    }
+    indSeries = [];
+  }
+
+  function lineData(cs, vals) {
+    var out = [];
+    for (var i = 0; i < cs.length; i++) {
+      var v = vals[i];
+      if (v !== null && v !== undefined && isFinite(v)) out.push({ time: cs[i].t / 1000 + TZ, value: v });
+    }
+    return out;
+  }
+
+  function addLine(cs, vals, color, scaleId) {
+    var opt = { color: color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false };
+    if (scaleId) opt.priceScaleId = scaleId;
+    var s = chart.addLineSeries(opt);
+    s.setData(lineData(cs, vals));
+    indSeries.push(s);
+    return s;
+  }
+
+  function runCustom(cs, o, h, l, c, t) {
+    var cc = cfg.custom;
+    if (!cc || !cc.on || !cc.code) { setCErr(""); return null; }
+    try {
+      var fn = new Function("o", "h", "l", "c", "t", "ta", cc.code);
+      var res = fn(o, h, l, c, t, ta);
+      var lines = [];
+      var colors = ["#f5c542", "#00bcd4", "#e91e63", "#8bc34a"];
+      var pane = false;
+      if (Array.isArray(res)) {
+        lines = [res];
+      } else if (res && Array.isArray(res.lines)) {
+        lines = res.lines;
+        if (Array.isArray(res.colors)) colors = res.colors.concat(colors);
+        pane = !!res.pane;
+      } else {
+        throw new Error("Return an array, or an object like {lines: [...], pane: true}");
+      }
+      var out = [];
+      for (var i = 0; i < lines.length; i++) {
+        if (!Array.isArray(lines[i])) throw new Error("Each line must be an array with one value per candle");
+        out.push({ vals: lines[i], color: colors[i % colors.length] });
+      }
+      setCErr("Running: " + out.length + " line(s)");
+      return { lines: out, pane: pane };
+    } catch (e) {
+      setCErr("Error: " + e.message);
+      return null;
+    }
+  }
+
+  function applyIndicators(cs) {
+    clearInd();
+    if (!cs.length || !chart) return;
+    var o = [], h = [], l = [], c = [], t = [];
+    for (var i = 0; i < cs.length; i++) { o.push(cs[i].o); h.push(cs[i].h); l.push(cs[i].l); c.push(cs[i].c); t.push(cs[i].t); }
+    var I = cfg.ind;
+
+    if (I.sma.on) addLine(cs, ta.sma(c, I.sma.p), "#f5c542");
+    if (I.ema1.on) addLine(cs, ta.ema(c, I.ema1.p), "#2962ff");
+    if (I.ema2.on) addLine(cs, ta.ema(c, I.ema2.p), "#ff6d00");
+    if (I.bb.on) {
+      var mid = ta.sma(c, I.bb.p);
+      var sd = ta.stdev(c, I.bb.p);
+      var up = [], lo = [];
+      for (var k = 0; k < c.length; k++) {
+        up.push(mid[k] === null ? null : mid[k] + I.bb.m * sd[k]);
+        lo.push(mid[k] === null ? null : mid[k] - I.bb.m * sd[k]);
+      }
+      addLine(cs, mid, "#787b86");
+      addLine(cs, up, "#2962ff");
+      addLine(cs, lo, "#2962ff");
+    }
+
+    var custom = runCustom(cs, o, h, l, c, t);
+    if (custom && !custom.pane) {
+      custom.lines.forEach(function (ln) { addLine(cs, ln.vals, ln.color); });
+    }
+
+    var panes = [];
+    if (I.rsi.on) {
+      panes.push(function (id) {
+        var s = addLine(cs, ta.rsi(c, I.rsi.p), "#b388ff", id);
+        s.createPriceLine({ price: 70, color: "#787b86", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "" });
+        s.createPriceLine({ price: 30, color: "#787b86", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "" });
+      });
+    }
+    if (I.macd.on) {
+      panes.push(function (id) {
+        var fast = ta.ema(c, I.macd.f);
+        var slow = ta.ema(c, I.macd.s);
+        var m = [];
+        for (var k = 0; k < c.length; k++) m.push(fast[k] === null || slow[k] === null ? null : fast[k] - slow[k]);
+        var sg = ta.ema(m, I.macd.g);
+        var hist = [];
+        for (var q = 0; q < c.length; q++) {
+          if (m[q] !== null && sg[q] !== null) hist.push({ time: cs[q].t / 1000 + TZ, value: m[q] - sg[q], color: (m[q] - sg[q]) >= 0 ? "rgba(38,166,154,0.6)" : "rgba(239,83,80,0.6)" });
+        }
+        var hs = chart.addHistogramSeries({ priceScaleId: id, priceLineVisible: false, lastValueVisible: false });
+        hs.setData(hist);
+        indSeries.push(hs);
+        addLine(cs, m, "#2962ff", id);
+        addLine(cs, sg, "#ff6d00", id);
+      });
+    }
+    if (custom && custom.pane) {
+      panes.push(function (id) {
+        custom.lines.forEach(function (ln) { addLine(cs, ln.vals, ln.color, id); });
+      });
+    }
+
+    var n = panes.length;
+    chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: n ? Math.min(0.62, 0.04 + 0.2 * n) : 0.06 } });
+    for (var p = 0; p < n; p++) {
+      var id = "pane" + p;
+      panes[p](id);
+      var bottom = 0.2 * p + 0.01;
+      chart.priceScale(id).applyOptions({ scaleMargins: { top: Math.max(0.05, 1 - bottom - 0.17), bottom: bottom } });
+    }
+  }
+
+  // ---------------- chart render ----------------
   function render() {
-    if (!data || !series) return;
+    if (!series) return;
     var cs = candlesOf();
     $("msg").style.display = cs.length ? "none" : "block";
+    if (!cs.length) $("msg").textContent = cur.error ? cur.error : "Loading candles...";
 
-    var key = tf + ":" + cs.length + ":" + (cs.length ? cs[cs.length - 1].t : 0);
+    var key = cfg.symbol + ":" + cfg.tf + ":" + cs.length + ":" + (cs.length ? cs[cs.length - 1].t : 0);
     if (key !== sig) {
       sig = key;
+      var pr = precisionFor(cs.length ? cs[cs.length - 1].c : 1000);
+      series.applyOptions({ priceFormat: { type: "price", precision: pr, minMove: Math.pow(10, -pr) } });
+      chart.applyOptions({ timeScale: { timeVisible: MS[cfg.tf] < 86400000 } });
       series.setData(cs.map(function (x) {
         return { time: x.t / 1000 + TZ, open: x.o, high: x.h, low: x.l, close: x.c };
       }));
@@ -1476,6 +2006,13 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
         needFit = false;
       }
     }
+
+    var ik = key + "|" + JSON.stringify([cfg.ind, cfg.custom]);
+    if (ik !== indSig) {
+      indSig = ik;
+      applyIndicators(cs);
+    }
+
     if (cs.length) {
       var lc = cs[cs.length - 1];
       lastBar = { open: lc.o, high: lc.h, low: lc.l, close: lc.c };
@@ -1493,19 +2030,18 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
         price: price, color: color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: title
       }));
     }
-    if (data.price) pl(data.price, "#ffffff", "live", 2);
-    if (showZ && data.htf && data.htf.eq) pl(data.htf.eq, "#b388ff", "4H 50%", 2);
-    var openSig = null;
-    for (var j = 0; j < data.signals.length; j++) {
-      if (data.signals[j].status === "open") { openSig = data.signals[j]; break; }
-    }
-    if (openSig) {
-      pl(openSig.entry, "#9e9e9e", "entry", 0);
-      pl(openSig.sl, "#ef5350", "SL", 0);
-      pl(openSig.tp, "#26a69a", "TP", 0);
+    if (isGold() && botData) {
+      if (botData.price) pl(botData.price, "#ffffff", "live", 2);
+      if (cfg.zones && botData.htf && botData.htf.eq) pl(botData.htf.eq, "#b388ff", "4H 50%", 2);
+      var os = openSignalOf(botData);
+      if (os) {
+        pl(os.entry, "#9e9e9e", "entry", 0);
+        pl(os.sl, "#ef5350", "SL", 0);
+        pl(os.tp, "#26a69a", "TP", 0);
+      }
     }
 
-    series.setMarkers(showM ? buildMarkers(cs) : []);
+    series.setMarkers(cfg.marks ? buildMarkers(cs) : []);
     buildZones(cs);
   }
 
@@ -1518,7 +2054,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     if (cv.height !== h) cv.height = h;
     var ctx = cv.getContext("2d");
     ctx.clearRect(0, 0, w, h);
-    if (!showZ || !chart || !series || !data || w === 0) return;
+    if (!cfg.zones || !chart || !series || w === 0) return;
     var cs = candlesOf();
     if (!cs.length) return;
 
@@ -1567,54 +2103,71 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   }
 
   function renderTop() {
-    var d = data;
-    var h = d.htf;
-    var p = d.plan;
-    var s = d.status;
+    var cs = candlesOf();
+    var last = cs.length ? cs[cs.length - 1] : null;
+    var gold = isGold();
+    var price = (gold && botData && botData.price) ? botData.price : (last ? last.c : null);
 
     var pe = $("price");
-    pe.textContent = d.price ? fmt(d.price) : "--";
-    if (d.price && lastPrice !== null && d.price !== lastPrice) pe.className = d.price > lastPrice ? "up" : "down";
-    if (d.price) lastPrice = d.price;
+    pe.textContent = price ? fmt(price) : "--";
+    if (price && lastPrice !== null && price !== lastPrice) pe.className = price > lastPrice ? "up" : "down";
+    if (price) lastPrice = price;
 
-    $("live").innerHTML = s.marketClosed
-      ? '<span class="warn">Market closed</span>'
-      : '<span class="up">&#9679; LIVE</span> <span class="dim">' + hhmm(d.now) + '</span>';
+    $("symSub").textContent = gold ? "Gold - Top-Down SMC strategy" : "Chart only";
+
+    var liveHtml = "";
+    if (gold && botData) {
+      liveHtml = botData.status.marketClosed
+        ? '<span class="warn">Market closed</span>'
+        : '<span class="up">&#9679; LIVE</span> <span class="dim">' + hhmm(botData.now) + '</span>';
+    } else if (cur.fetchedAt) {
+      liveHtml = '<span class="dim">candles ' + ago(cur.fetchedAt) + '</span>';
+    } else {
+      liveHtml = '<span class="dim">loading...</span>';
+    }
+    $("live").innerHTML = liveHtml;
 
     var f = "";
-    if (h && h.bias) f += chip("4H " + h.bias.toUpperCase() + (h.zone ? " - " + h.zone : ""), h.bias === "bullish" ? "up" : "down");
-    else f += chip("4H bias unclear", "dim");
-    var os = openSignalOf(d);
-    if (os) f += chip("Signal open: " + os.dir, "warn");
-    else if (p) f += chip("Watching " + (p.dir === "bullish" ? "buy" : "sell") + " zone " + fmt(p.zoneBottom) + "-" + fmt(p.zoneTop), "warn");
-    else f += chip("Searching for a 15M setup", "dim");
+    if (gold && botData) {
+      var h = botData.htf;
+      var p = botData.plan;
+      if (h && h.bias) f += chip("4H " + h.bias.toUpperCase() + (h.zone ? " - " + h.zone : ""), h.bias === "bullish" ? "up" : "down");
+      else f += chip("4H bias unclear", "dim");
+      var os = openSignalOf(botData);
+      if (os) f += chip("Signal open: " + os.dir, "warn");
+      else if (p) f += chip("Watching " + (p.dir === "bullish" ? "buy" : "sell") + " zone " + num(p.zoneBottom) + "-" + num(p.zoneTop), "warn");
+      else f += chip("Searching for a 15M setup", "dim");
+    } else if (!gold) {
+      f += chip("Strategy signals run on XAU/USD only", "dim");
+    }
     $("float").innerHTML = f;
 
-    $("sigLabel").textContent = os ? "Signals \u25CF" : "Signals";
+    $("sigLabel").textContent = (botData && openSignalOf(botData)) ? "Signals \u25CF" : "Signals";
   }
 
   function renderAnalysis() {
-    var d = data;
+    if (!botData) return;
+    var d = botData;
     var h = d.htf;
     var p = d.plan;
     var pr = d.progress;
 
-    var html = '<div class="card"><h3>Top-down check</h3>';
+    var html = '<div class="card"><h3>Top-down check (XAU/USD)</h3>';
 
     html += row("1&#65039;&#8419; 4H bias", h && h.bias
       ? '<b class="' + (h.bias === "bullish" ? "up" : "down") + '">' + h.bias.toUpperCase() + '</b>'
       : '<span class="dim">not clear yet</span>');
     if (h) {
-      html += row("4H range", fmt(h.rangeLow) + " - " + fmt(h.rangeHigh));
-      html += row("50% level", fmt(h.eq));
+      html += row("4H range", num(h.rangeLow) + " - " + num(h.rangeHigh));
+      html += row("50% level", num(h.eq));
       html += row("Price is in", h.zone ? (h.zone === "discount" ? '<span class="up">DISCOUNT (buys)</span>' : '<span class="down">PREMIUM (sells)</span>') : "--");
     }
 
     if (p) {
       var buy = p.dir === "bullish";
       html += row("2&#65039;&#8419; 15M break", '<b class="' + (buy ? "up" : "down") + '">' + esc(p.label) + " " + p.dir + '</b> &#10003;');
-      html += row("Displacement (FVG)", p.fvgTop !== null && p.fvgTop !== undefined ? fmt(p.fvgBottom) + " - " + fmt(p.fvgTop) + " &#10003;" : "--");
-      html += row("Order Block zone", fmt(p.zoneBottom) + " - " + fmt(p.zoneTop) + " &#10003;");
+      html += row("Displacement (FVG)", p.fvgTop !== null && p.fvgTop !== undefined ? num(p.fvgBottom) + " - " + num(p.fvgTop) + " &#10003;" : "--");
+      html += row("Order Block zone", num(p.zoneBottom) + " - " + num(p.zoneTop) + " &#10003;");
       html += row("Liquidity sweep", p.sweep ? '<span class="up">yes &#10003;</span>' : '<span class="dim">no (bonus only)</span>');
       html += row("OB + FVG overlap", p.overlap ? '<span class="up">yes &#10003;</span>' : '<span class="dim">no</span>');
     } else {
@@ -1623,7 +2176,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
 
     if (p && pr) {
       html += row("3&#65039;&#8419; 5M tap of zone", pr.tapped ? '<span class="up">tapped ' + hhmm(pr.tapTime) + ' &#10003;</span>' : '<span class="warn">waiting</span>');
-      if (pr.level !== null && pr.level !== undefined) html += row("5M needs a close beyond", fmt(pr.level));
+      if (pr.level !== null && pr.level !== undefined) html += row("5M needs a close beyond", num(pr.level));
       html += row("Status", esc(pr.note || ""));
     } else {
       html += row("3&#65039;&#8419; 5M entry", '<span class="dim">starts after a 15M zone is found</span>');
@@ -1643,7 +2196,8 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
   }
 
   function renderSignals() {
-    var d = data;
+    if (!botData) return;
+    var d = botData;
     var s = d.status;
     var os = openSignalOf(d);
     var html = "";
@@ -1651,9 +2205,9 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     if (os) {
       html += '<div class="card"><h3>Open signal</h3>';
       html += row("Direction", '<b class="' + (os.dir === "BUY" ? "up" : "down") + '">' + os.dir + '</b>');
-      html += row("Entry", fmt(os.entry));
-      html += row("Stop loss", fmt(os.sl));
-      html += row("Take profit", fmt(os.tp));
+      html += row("Entry", num(os.entry));
+      html += row("Stop loss", num(os.sl));
+      html += row("Take profit", num(os.tp));
       html += row("Opened", new Date(os.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }));
       html += '</div>';
     }
@@ -1671,7 +2225,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       html += '<table><tr><th>Time</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Result</th></tr>';
       d.signals.forEach(function (x) {
         var res = x.status === "win" ? '<span class="up">TP</span>' : x.status === "loss" ? '<span class="down">SL</span>' : '<span class="warn">open</span>';
-        html += '<tr><td>' + new Date(x.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) + '</td><td>' + x.dir + '</td><td>' + fmt(x.entry) + '</td><td>' + fmt(x.sl) + '</td><td>' + fmt(x.tp) + '</td><td>' + res + '</td></tr>';
+        html += '<tr><td>' + new Date(x.time).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) + '</td><td>' + x.dir + '</td><td>' + num(x.entry) + '</td><td>' + num(x.sl) + '</td><td>' + num(x.tp) + '</td><td>' + res + '</td></tr>';
       });
       html += '</table>';
     } else {
@@ -1682,54 +2236,214 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     $("pSignals").innerHTML = html;
   }
 
-  function renderData() {
-    var d = data;
-    var s = d.status;
-    var html = '<div class="card"><h3>Data feed</h3>';
-    html += row("Status", esc(s.dataStatus));
-    html += row("Market", s.marketClosed ? '<span class="warn">closed</span>' : '<span class="up">open</span>');
-    html += row("5M candles updated", ago(s.lastFetch["5m"]));
-    html += row("15M candles updated", ago(s.lastFetch["15m"]));
-    html += row("4H candles updated", ago(s.lastFetch["4h"]));
-    html += row("Twelve Data credits used today", s.creditsUsed + " / 800");
+  // ---------------- indicators page ----------------
+  function renderIndicators() {
+    var html = '<div class="card"><h3>Indicators on the chart</h3>';
+    IND_ORDER.forEach(function (k) {
+      var I = cfg.ind[k];
+      var fields = "";
+      IND_FIELDS[k].forEach(function (f) {
+        fields += ' ' + f[1] + ' <input type="number" class="num" data-k="' + k + '" data-f="' + f[0] + '" value="' + I[f[0]] + '">';
+      });
+      html += '<div class="row"><label class="lbl"><input type="checkbox" data-k="' + k + '" data-f="on"' + (I.on ? " checked" : "") + '> ' + I.name + '</label><span class="small dim">' + fields + '</span></div>';
+    });
     html += '</div>';
 
-    html += '<div class="card"><h3>Strategy</h3>';
+    html += '<div class="card"><h3>Custom indicator (code box)</h3>';
+    html += '<p class="dim small">Pine Script only runs inside TradingView, so it cannot run here. Write the indicator in JavaScript instead, or send the Pine code to your assistant and ask for it to be converted. Only paste code you trust.</p>';
+    html += '<textarea id="cCode" class="code" rows="9" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>';
+    html += '<div><button class="btn" id="cRun">Apply</button><button class="btn gray" id="cEx">Example</button><button class="btn gray" id="cOff">Remove</button></div>';
+    html += '<div id="cErr" class="small warn" style="margin-top:8px"></div>';
+    html += '<p class="dim small" style="margin-top:8px">You can use o, h, l, c, t (open, high, low, close, time of every candle) and ta.sma, ta.ema, ta.rsi, ta.stdev, ta.highest, ta.lowest, ta.atr(h, l, c, period). Return one array for a line on the price, or an object like {lines: [a, b], colors: [...], pane: true} (pane: true draws in a separate area under the chart).</p>';
+    html += '</div>';
+
+    $("pInd").innerHTML = html;
+    $("cCode").value = cfg.custom.code || "";
+    setCErr(cfg.custom.on ? "Running" : "");
+  }
+
+  $("pInd").onchange = function (e) {
+    var t = e.target;
+    var k = t.getAttribute("data-k");
+    var f = t.getAttribute("data-f");
+    if (!k || !f || !cfg.ind[k]) return;
+    if (f === "on") cfg.ind[k].on = !!t.checked;
+    else {
+      var v = parseFloat(t.value);
+      if (isFinite(v) && v > 0) cfg.ind[k][f] = v;
+    }
+    saveCfg();
+    render();
+  };
+  $("pInd").onclick = function (e) {
+    var id = e.target.id;
+    if (id === "cRun") {
+      cfg.custom.code = $("cCode").value;
+      cfg.custom.on = !!cfg.custom.code.replace(/\s/g, "");
+      saveCfg();
+      indSig = "";
+      render();
+    } else if (id === "cEx") {
+      $("cCode").value = EXAMPLE;
+    } else if (id === "cOff") {
+      cfg.custom.on = false;
+      saveCfg();
+      indSig = "";
+      render();
+      setCErr("Removed");
+    }
+  };
+
+  // ---------------- settings page ----------------
+  function tfOptions(selected) {
+    var h = "";
+    TFS.forEach(function (x) { h += '<option value="' + x[0] + '"' + (x[0] === selected ? " selected" : "") + '>' + x[1] + '</option>'; });
+    return h;
+  }
+
+  function fillSymSel() {
+    var h = "";
+    cfg.pairs.forEach(function (p) { h += '<option value="' + esc(p) + '"' + (p === cfg.symbol ? " selected" : "") + '>' + esc(p) + '</option>'; });
+    $("symSel").innerHTML = h;
+    $("symSel").value = cfg.symbol;
+  }
+
+  function renderSettings() {
+    var html = '<div class="card"><h3>Pairs</h3>';
+    cfg.pairs.forEach(function (p, i) {
+      html += '<div class="row"><span>' + esc(p) + (p === GOLD ? ' <span class="dim small">(strategy runs here)</span>' : '') + '</span><span><button class="mini" data-del="' + i + '">Remove</button></span></div>';
+    });
+    html += '<div class="row"><span><input id="newPair" class="txt" placeholder="e.g. USD/JPY" autocapitalize="characters" autocomplete="off"></span><span><button class="mini" id="addPair">Add</button></span></div>';
+    html += '<div id="pairErr" class="small warn"></div>';
+    html += '<p class="dim small" style="margin-top:8px">Other pairs are chart-only. Every pair and timeframe you open is loaded when needed and reused for a while. It uses Twelve Data credits (see Data feed below).</p>';
+    html += '</div>';
+
+    html += '<div class="card"><h3>Chart</h3>';
+    html += row("Default timeframe", '<select id="defTf" class="txt" style="width:90px">' + tfOptions(cfg.tf) + '</select>');
+    html += row("Show zones and levels", '<input type="checkbox" id="optZones"' + (cfg.zones ? " checked" : "") + '>');
+    html += row("Show arrows (BOS / CHoCH / signals)", '<input type="checkbox" id="optMarks"' + (cfg.marks ? " checked" : "") + '>');
+    html += '<div style="margin-top:10px"><button class="btn gray" id="resetInd">Reset indicators</button></div>';
+    html += '</div>';
+
+    html += '<div id="dataCard"></div>';
+
+    html += '<div class="card"><h3>Strategy (XAU/USD)</h3>';
     html += row("Flow", "4H bias &#8594; 15M zone &#8594; 5M entry");
     html += row("Minimum reward : risk", "1 : 2");
     html += row("Signal hours", localHour(7) + " - " + localHour(20) + " (your time)");
     html += row("One signal at a time", "yes");
     html += '</div>';
 
-    $("pData").innerHTML = html;
+    $("pSet").innerHTML = html;
+    renderSettingsData();
+  }
+
+  function renderSettingsData() {
+    var box = $("dataCard");
+    if (!box) return;
+    var s = botData ? botData.status : null;
+    var html = '<div class="card"><h3>Data feed</h3>';
+    if (s) {
+      html += row("Status", esc(s.dataStatus));
+      html += row("Gold market", s.marketClosed ? '<span class="warn">closed</span>' : '<span class="up">open</span>');
+      html += row("5M candles updated", ago(s.lastFetch["5m"]));
+      html += row("15M candles updated", ago(s.lastFetch["15m"]));
+      html += row("4H candles updated", ago(s.lastFetch["4h"]));
+      html += row("Twelve Data credits used today", s.creditsUsed + " / 800");
+      html += row("Extra chart loads today", s.onDemandUsed + " / " + s.onDemandCap);
+    } else {
+      html += '<span class="dim">Loading...</span>';
+    }
+    html += '</div>';
+    box.innerHTML = html;
   }
 
   function renderPanel() {
     renderTop();
     renderAnalysis();
     renderSignals();
-    renderData();
+    renderSettingsData();
   }
 
-  // ---------------- data polling ----------------
-  function poll() {
-    fetch("/api/panel", { credentials: "same-origin", cache: "no-store" })
-      .then(function (r) {
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
-      })
-      .then(function (j) {
-        data = j;
-        showErr("");
-        render();
-        renderPanel();
-      })
-      .catch(function (e) {
-        showErr("Connection problem: " + e.message + " (retrying)");
-      });
-  }
+  $("pSet").onclick = function (e) {
+    var t = e.target;
+    var del = t.getAttribute ? t.getAttribute("data-del") : null;
+    if (del !== null && del !== undefined) {
+      var i = parseInt(del, 10);
+      if (cfg.pairs.length > 1 && i >= 0 && i < cfg.pairs.length) {
+        var gone = cfg.pairs.splice(i, 1)[0];
+        var wasCurrent = gone === cfg.symbol;
+        if (wasCurrent) cfg.symbol = cfg.pairs[0];
+        saveCfg();
+        fillSymSel();
+        renderSettings();
+        if (wasCurrent) switchTo(cfg.symbol, cfg.tf);
+      }
+    } else if (t.id === "addPair") {
+      var inp = $("newPair");
+      var v = String(inp.value || "").toUpperCase().replace(/\s/g, "");
+      if (v.indexOf("/") < 0 && v.length === 6) v = v.slice(0, 3) + "/" + v.slice(3);
+      if (!/^[A-Z]{2,6}\/[A-Z]{2,6}$/.test(v)) { $("pairErr").textContent = "Use a pair like EUR/USD."; return; }
+      if (cfg.pairs.indexOf(v) >= 0) { $("pairErr").textContent = "Already in the list."; return; }
+      if (cfg.pairs.length >= 40) { $("pairErr").textContent = "List is full (40 pairs)."; return; }
+      cfg.pairs.push(v);
+      saveCfg();
+      fillSymSel();
+      renderSettings();
+    } else if (t.id === "resetInd") {
+      for (var k in IND_DEF) {
+        var d = {};
+        for (var f in IND_DEF[k]) d[f] = IND_DEF[k][f];
+        cfg.ind[k] = d;
+      }
+      cfg.custom = { code: "", on: false };
+      saveCfg();
+      indSig = "";
+      renderIndicators();
+      render();
+    }
+  };
+  $("pSet").onchange = function (e) {
+    var t = e.target;
+    if (t.id === "defTf") {
+      switchTo(cfg.symbol, t.value);
+    } else if (t.id === "optZones") {
+      cfg.zones = !!t.checked;
+      $("tZones").className = cfg.zones ? "on" : "";
+      saveCfg();
+      render();
+    } else if (t.id === "optMarks") {
+      cfg.marks = !!t.checked;
+      $("tMarks").className = cfg.marks ? "on" : "";
+      saveCfg();
+      render();
+    }
+  };
 
   // ---------------- controls ----------------
+  function buildTfButtons() {
+    var h = "";
+    TFS.forEach(function (x) { h += '<button data-tf="' + x[0] + '" class="' + (x[0] === cfg.tf ? "on" : "") + '">' + x[1] + '</button>'; });
+    $("tfbtns").innerHTML = h;
+  }
+
+  function switchTo(symbol, tf) {
+    cfg.symbol = symbol;
+    cfg.tf = tf;
+    saveCfg();
+    sig = "";
+    indSig = "";
+    needFit = true;
+    cur = { candles: [] };
+    reqId++;
+    buildTfButtons();
+    $("symSel").value = cfg.symbol;
+    showErr("");
+    render();
+    renderTop();
+    loadChart();
+  }
+
   function showPage(id) {
     var pgs = document.querySelectorAll(".page");
     for (var i = 0; i < pgs.length; i++) {
@@ -1743,35 +2457,44 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     if (id === "pChart") setTimeout(resizeChart, 30);
   }
 
-  var nbs0 = document.querySelectorAll("#nav button");
-  for (var a = 0; a < nbs0.length; a++) {
-    nbs0[a].onclick = function () { showPage(this.getAttribute("data-page")); };
+  var navBtns = document.querySelectorAll("#nav button");
+  for (var a = 0; a < navBtns.length; a++) {
+    navBtns[a].onclick = function () { showPage(this.getAttribute("data-page")); };
   }
 
-  var tfb = document.querySelectorAll("#tfbtns button");
-  for (var b = 0; b < tfb.length; b++) {
-    tfb[b].onclick = function () {
-      tf = this.getAttribute("data-tf");
-      for (var k = 0; k < tfb.length; k++) tfb[k].className = tfb[k] === this ? "tf on" : "tf";
-      needFit = true;
-      sig = "";
-      render();
-    };
-  }
+  $("tfbtns").onclick = function (e) {
+    var t = e.target.getAttribute ? e.target.getAttribute("data-tf") : null;
+    if (t && t !== cfg.tf) switchTo(cfg.symbol, t);
+  };
+  $("symSel").onchange = function () { switchTo(this.value, cfg.tf); };
 
+  $("tZones").className = cfg.zones ? "on" : "";
+  $("tMarks").className = cfg.marks ? "on" : "";
   $("tZones").onclick = function () {
-    showZ = !showZ;
-    this.className = showZ ? "on" : "";
+    cfg.zones = !cfg.zones;
+    this.className = cfg.zones ? "on" : "";
+    saveCfg();
     render();
   };
   $("tMarks").onclick = function () {
-    showM = !showM;
-    this.className = showM ? "on" : "";
+    cfg.marks = !cfg.marks;
+    this.className = cfg.marks ? "on" : "";
+    saveCfg();
     render();
   };
 
-  poll();
-  setInterval(poll, 15000);
+  // ---------------- start ----------------
+  fillSymSel();
+  buildTfButtons();
+  renderIndicators();
+  renderSettings();
+  pollBot();
+  loadChart();
+  setInterval(function () {
+    pollBot();
+    tick++;
+    if (!usingBot() && tick % 2 === 0) loadChart();
+  }, 15000);
   loadLib(initChart);
 })();
 </script>
