@@ -1,3 +1,4 @@
+
 const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
 const axios = require("axios");
@@ -11,15 +12,14 @@ if (!token) {
   process.exit(1);
 }
 
-// The Twelve Data key is read from whichever Render variable name
-// starts with "TWE" (e.g. TWELVE_DATA_API_KEY). The key is never logged.
+// Read the Twelve Data API key from Render environment variables.
 const TD_KEY_NAME = Object.keys(process.env).find(k => k.toUpperCase().startsWith("TWE"));
 const TD_KEY = TD_KEY_NAME
   ? String(process.env[TD_KEY_NAME]).trim().replace(/^["']|["']$/g, "")
   : null;
 
 if (!TD_KEY) {
-  console.error("No Twelve Data key found. Add a variable such as TWELVE_DATA_API_KEY in Render.");
+  console.error("No Twelve Data key found. Add TWELVE_DATA_API_KEY in Render.");
 } else {
   console.log(`Twelve Data key loaded from variable: ${TD_KEY_NAME}`);
 }
@@ -32,9 +32,6 @@ app.use(express.urlencoded({ extended: true }));
 
 // ===============================
 // ADMIN PANEL LOGIN
-// ===============================
-// Set ADMIN_USER / ADMIN_PASSWORD in Render's Environment tab.
-// Defaults are admin / changeme123 - change them.
 // ===============================
 
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
@@ -75,54 +72,54 @@ const mainMenu = {
   }
 };
 
-const subscribers = new Map(); // chatId -> { username, firstName, joinedAt }
-const signalHistory = [];      // most recent first
+const subscribers = new Map();
+const signalHistory = [];
 const MAX_SIGNAL_HISTORY = 100;
 const botStartedAt = Date.now();
 
 // ================================================================
-// STRATEGY SETTINGS  (top-down SMC: 4H bias -> 15M zone -> 5M entry)
+// STRATEGY SETTINGS: 1H BIAS -> 15M ZONE -> 5M ENTRY
 // ================================================================
 
 const SYMBOL = "XAU/USD";
 
 const TF = {
-  "4h":  { interval: "4h",    ms: 4 * 60 * 60 * 1000, size: 120 },
-  "15m": { interval: "15min", ms: 15 * 60 * 1000,     size: 150 },
-  "5m":  { interval: "5min",  ms: 5 * 60 * 1000,      size: 150 }
+  "1h":  { interval: "1h",    ms: 60 * 60 * 1000, size: 120 },
+  "15m": { interval: "15min", ms: 15 * 60 * 1000, size: 150 },
+  "5m":  { interval: "5min",  ms: 5 * 60 * 1000, size: 150 }
 };
 
-const SWING_LOOKBACK = { "4h": 2, "15m": 2, "5m": 1 };
+const SWING_LOOKBACK = { "1h": 2, "15m": 2, "5m": 1 };
 
-const HTF_RANGE_CANDLES = 36;        // 4H candles used for the premium/discount range (~6 days)
-const SETUP_FRESH_CANDLES = 30;      // the 15M structure break must be this recent (~7.5h)
-const IMPULSE_WINDOW = 10;           // 15M candles searched back from the break for the leg origin
-const TOUCH_LOOKBACK_5M = 18;        // 5M candles (~90 min) in which the zone tap must have happened
+const HTF_RANGE_CANDLES = 36;
+const SETUP_FRESH_CANDLES = 30;
+const IMPULSE_WINDOW = 10;
+const TOUCH_LOOKBACK_5M = 18;
 const PLAN_EXPIRY_MS = 6 * 60 * 60 * 1000;
-const INVALIDATION_BUFFER = 0.5;     // $ beyond the zone that kills the setup (candle close)
+const INVALIDATION_BUFFER = 0.5;
 
-const PIP_SIZE = 0.1;                // 1 "pip" = $0.10
-const SL_BUFFER = 1.0;               // $ beyond the 5M extreme / zone
+const PIP_SIZE = 0.1;
+const SL_BUFFER = 1.0;
 const MIN_SL_USD = 1.5;
 const MAX_SL_USD = 15;
 const MIN_RR = 2;
 
-const SESSION_FILTER = true;         // only fire signals during London + New York hours
+const SESSION_FILTER = true;
 const SESSION_START_UTC = 7;
 const SESSION_END_UTC = 20;
 
 const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000;
 
-// Twelve Data free plan = 800 credits/day, 8/minute
-const FETCH_DELAY_MS = 15000;        // wait after a candle closes before fetching it
-const RETRY_MS = 60000;              // minimum gap between retries of a failed fetch
-const DAILY_CREDIT_LIMIT = 700;      // safety stop, below the 800 limit
+// Twelve Data usage safeguards
+const FETCH_DELAY_MS = 15000;
+const RETRY_MS = 60000;
+const DAILY_CREDIT_LIMIT = 700;
 
 // ================================================================
 // DATA STATE
 // ================================================================
 
-const candles = { "4h": [], "15m": [], "5m": [] }; // closed candles only, oldest first
+const candles = { "1h": [], "15m": [], "5m": [] };
 const lastBucket = {};
 const lastAttempt = {};
 const lastFetchOk = {};
@@ -147,39 +144,50 @@ function rolloverCredits() {
 
 function nextUtcMidnight() {
   const n = new Date();
-  return Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1) + 60000;
+  return Date.UTC(
+    n.getUTCFullYear(),
+    n.getUTCMonth(),
+    n.getUTCDate() + 1
+  ) + 60000;
 }
 
-// Gold is closed from Friday 22:00 UTC until Sunday 22:00 UTC
+// Gold market closing hours
 function isMarketClosed(now = new Date()) {
   const d = now.getUTCDay();
   const h = now.getUTCHours();
+
   if (d === 6) return true;
   if (d === 5 && h >= 22) return true;
   if (d === 0 && h < 22) return true;
+
   return false;
 }
 
 async function fetchCandles(tf) {
   const cfg = TF[tf];
 
-  const res = await axios.get("https://api.twelvedata.com/time_series", {
-    params: {
-      symbol: SYMBOL,
-      interval: cfg.interval,
-      outputsize: cfg.size,
-      order: "asc",
-      timezone: "UTC",
-      apikey: TD_KEY
-    },
-    timeout: 15000
-  });
+  const res = await axios.get(
+    "https://api.twelvedata.com/time_series",
+    {
+      params: {
+        symbol: SYMBOL,
+        interval: cfg.interval,
+        outputsize: cfg.size,
+        order: "asc",
+        timezone: "UTC",
+        apikey: TD_KEY
+      },
+      timeout: 15000
+    }
+  );
 
   creditsUsed++;
   const d = res.data;
 
   if (!d || d.status === "error" || !Array.isArray(d.values)) {
-    const err = new Error((d && d.message) || "Bad response from Twelve Data");
+    const err = new Error(
+      (d && d.message) || "Bad response from Twelve Data"
+    );
     err.apiCode = d && d.code;
     throw err;
   }
@@ -196,19 +204,27 @@ async function fetchCandles(tf) {
     }))
     .filter(c =>
       Number.isFinite(c.t) &&
-      Number.isFinite(c.open) && Number.isFinite(c.high) &&
-      Number.isFinite(c.low) && Number.isFinite(c.close) &&
-      c.t + cfg.ms <= now + 2000          // drop the candle that is still forming
+      Number.isFinite(c.open) &&
+      Number.isFinite(c.high) &&
+      Number.isFinite(c.low) &&
+      Number.isFinite(c.close) &&
+      c.t + cfg.ms <= now + 2000
     );
 }
 
 function handleDataError(e) {
   const body = e.response && e.response.data;
   const msg = (body && body.message) || e.message || "Unknown error";
-  const code = (body && body.code) || e.apiCode || (e.response && e.response.status);
+  const code = (body && body.code) ||
+    e.apiCode ||
+    (e.response && e.response.status);
 
   dataStatus = `Error: ${String(msg).slice(0, 140)}`;
-  console.error("Twelve Data error:", code, String(msg).slice(0, 200));
+  console.error(
+    "Twelve Data error:",
+    code,
+    String(msg).slice(0, 200)
+  );
 
   if (/for the day/i.test(msg)) {
     pausedUntil = nextUtcMidnight();
@@ -221,8 +237,7 @@ function handleDataError(e) {
   }
 }
 
-// Runs every 20s. Each timeframe is fetched ONCE per candle close, so
-// usage is about 288 (5m) + 96 (15m) + 6 (4h) credits per day.
+// Fetch data when a new candle has closed.
 async function dataTick() {
   if (fetching) return;
   fetching = true;
@@ -234,6 +249,7 @@ async function dataTick() {
       dataStatus = "No Twelve Data key found in Render variables";
       return;
     }
+
     if (Date.now() < pausedUntil) return;
 
     const closed = isMarketClosed();
@@ -247,7 +263,9 @@ async function dataTick() {
 
       const now = Date.now();
       const bucket = Math.floor(now / cfg.ms);
-      const due = !have || (lastBucket[tf] !== bucket && now - bucket * cfg.ms >= FETCH_DELAY_MS);
+      const due = !have ||
+        (lastBucket[tf] !== bucket &&
+         now - bucket * cfg.ms >= FETCH_DELAY_MS);
 
       if (!due) continue;
       if (now - (lastAttempt[tf] || 0) < RETRY_MS) continue;
@@ -265,7 +283,10 @@ async function dataTick() {
         lastFetchOk[tf] = Date.now();
         updated = true;
         dataStatus = "OK";
-        console.log(`[DATA] ${tf}: ${candles[tf].length} candles | credits today: ${creditsUsed}`);
+
+        console.log(
+          `[DATA] ${tf}: ${candles[tf].length} candles | credits today: ${creditsUsed}`
+        );
       } catch (e) {
         handleDataError(e);
         if (Date.now() < pausedUntil) break;
@@ -275,7 +296,6 @@ async function dataTick() {
     }
 
     if (updated) analyze();
-
   } catch (e) {
     console.error("Data tick error:", e.message);
   } finally {
@@ -284,8 +304,7 @@ async function dataTick() {
 }
 
 // ================================================================
-// LIVE PRICE (no Twelve Data credits - used for the price button and
-// for checking TP/SL on open signals)
+// LIVE PRICE
 // ================================================================
 
 let cached = { price: null, time: 0 };
@@ -296,23 +315,33 @@ async function getGoldPrice() {
   }
 
   const sources = [
-    async () => Number((await axios.get(
-      "https://api.gold-api.com/price/XAU",
-      { timeout: 10000 })).data.price),
-    async () => Number((await axios.get(
-      "https://xaus.com/api/v1/spot?compact=1",
-      { timeout: 10000 })).data.xau.price)
+    async () => Number(
+      (await axios.get(
+        "https://api.gold-api.com/price/XAU",
+        { timeout: 10000 }
+      )).data.price
+    ),
+    async () => Number(
+      (await axios.get(
+        "https://xaus.com/api/v1/spot?compact=1",
+        { timeout: 10000 }
+      )).data.xau.price
+    )
   ];
 
   for (const source of sources) {
     try {
       const p = await source();
+
       if (p > 0) {
         cached = { price: p, time: Date.now() };
         return p;
       }
     } catch (e) {
-      console.error("Price source failed:", (e.response && e.response.status) || e.message);
+      console.error(
+        "Price source failed:",
+        (e.response && e.response.status) || e.message
+      );
     }
   }
 
@@ -321,6 +350,7 @@ async function getGoldPrice() {
   }
 
   const c5 = candles["5m"];
+
   if (c5.length > 0) {
     return c5[c5.length - 1].close;
   }
@@ -332,8 +362,7 @@ async function getGoldPrice() {
 // STRUCTURE TOOLS
 // ================================================================
 
-// Swing high/low (fractal). A swing at index i is only confirmed once
-// `lookback` candles after it exist.
+// Confirmed swing high/low
 function findSwings(arr, lookback) {
   const swings = [];
 
@@ -341,16 +370,27 @@ function findSwings(arr, lookback) {
     const slice = arr.slice(i - lookback, i + lookback + 1);
     const c = arr[i];
 
-    if (slice.every(s => s.high <= c.high)) swings.push({ index: i, price: c.high, type: "high" });
-    if (slice.every(s => s.low >= c.low)) swings.push({ index: i, price: c.low, type: "low" });
+    if (slice.every(s => s.high <= c.high)) {
+      swings.push({
+        index: i,
+        price: c.high,
+        type: "high"
+      });
+    }
+
+    if (slice.every(s => s.low >= c.low)) {
+      swings.push({
+        index: i,
+        price: c.low,
+        type: "low"
+      });
+    }
   }
 
   return swings;
 }
 
-// Walks the candles in order and records every close-based break of the
-// latest swing high/low. A break in the direction of the running trend is
-// a BOS; a break against it is a CHoCH (change of character).
+// Identify BOS and CHoCH from candle closes.
 function analyzeStructure(arr, lookback) {
   const swings = findSwings(arr, lookback);
   const breaks = [];
@@ -361,8 +401,12 @@ function analyzeStructure(arr, lookback) {
   let si = 0;
 
   for (let i = 0; i < arr.length; i++) {
-    while (si < swings.length && swings[si].index + lookback <= i) {
+    while (
+      si < swings.length &&
+      swings[si].index + lookback <= i
+    ) {
       const s = swings[si++];
+
       if (s.type === "high") lastHigh = s;
       else lastLow = s;
     }
@@ -376,6 +420,7 @@ function analyzeStructure(arr, lookback) {
         index: i,
         level: lastHigh.price
       });
+
       trend = "bullish";
       lastHigh.broken = true;
     } else if (lastLow && !lastLow.broken && c.close < lastLow.price) {
@@ -385,6 +430,7 @@ function analyzeStructure(arr, lookback) {
         index: i,
         level: lastLow.price
       });
+
       trend = "bearish";
       lastLow.broken = true;
     }
@@ -394,14 +440,15 @@ function analyzeStructure(arr, lookback) {
 }
 
 // ================================================================
-// STEP 1 - 4H BIAS + PREMIUM / DISCOUNT RANGE
+// STEP 1 - 1H BIAS + PREMIUM / DISCOUNT RANGE
 // ================================================================
 
 function getHTF() {
-  const c = candles["4h"];
+
+  const c = candles["1h"];
   if (c.length < 30) return null;
 
-  const st = analyzeStructure(c, SWING_LOOKBACK["4h"]);
+  const st = analyzeStructure(c, SWING_LOOKBACK["1h"]);
   const recent = c.slice(-HTF_RANGE_CANDLES);
 
   const rangeHigh = Math.max(...recent.map(x => x.high));
@@ -418,17 +465,10 @@ function getHTF() {
 }
 
 // ================================================================
-// STEP 2 - 15M: structure break in the bias direction + POI
-// ================================================================
-// Requirements:
-//  - the latest 15M break is in the 4H bias direction (BOS or CHoCH)
-//  - the break was made with displacement (it left a Fair Value Gap)
-//  - the Order Block that started the move is still unmitigated
-//  - the Order Block sits in discount (buys) or premium (sells) of the 4H range
-// Bonus confluences: liquidity sweep before the move, OB overlapping the FVG.
+// STEP 2 - 15M: STRUCTURE BREAK + POINT OF INTEREST
 // ================================================================
 
-const deadPOIs = new Set(); // order blocks already used or invalidated
+const deadPOIs = new Set();
 
 function find15mSetup(htf) {
   const c = candles["15m"];
@@ -444,71 +484,90 @@ function find15mSetup(htf) {
   const b = last.index;
   if (b < c.length - 1 - SETUP_FRESH_CANDLES) return null;
 
-  // Origin of the impulse leg: lowest low (buys) / highest high (sells) before the break
-  const from = Math.max(0, b - IMPULSE_WINDOW);
-  let o = from;
-  for (let i = from; i <= b; i++) {
-    if (bull ? c[i].low < c[o].low : c[i].high > c[o].high) o = i;
+  let o = Math.max(0, b - IMPULSE_WINDOW);
+
+  for (let i = o; i <= b; i++) {
+    if (bull ? c[i].low < c[o].low : c[i].high > c[o].high) {
+      o = i;
+    }
   }
 
-  // Order Block = last opposite-colour candle at the origin
   let obIdx = o;
+
   for (let i = o; i >= Math.max(0, o - 3); i--) {
-    const opposite = bull ? c[i].close < c[i].open : c[i].close > c[i].open;
+    const opposite = bull
+      ? c[i].close < c[i].open
+      : c[i].close > c[i].open;
+
     if (opposite) {
       obIdx = i;
       break;
     }
   }
-  const zone = { top: c[obIdx].high, bottom: c[obIdx].low };
 
-  // Displacement: a Fair Value Gap inside the impulse
+  const zone = {
+    top: c[obIdx].high,
+    bottom: c[obIdx].low
+  };
+
   let fvg = null;
   const endI = Math.min(b + 1, c.length - 1);
+
   for (let i = Math.max(2, o + 1); i <= endI; i++) {
     const c1 = c[i - 2];
     const c3 = c[i];
+
     if (bull && c1.high < c3.low) {
       fvg = { top: c3.low, bottom: c1.high };
       break;
     }
+
     if (!bull && c1.low > c3.high) {
       fvg = { top: c1.low, bottom: c3.high };
       break;
     }
   }
+
   if (!fvg) return null;
 
   const obTime = c[obIdx].t;
   if (deadPOIs.has(obTime)) return null;
 
-  // Zone must not already be broken through
   for (let k = b + 1; k < c.length; k++) {
-    if (bull && c[k].close < zone.bottom - INVALIDATION_BUFFER) return null;
-    if (!bull && c[k].close > zone.top + INVALIDATION_BUFFER) return null;
+    if (bull && c[k].close < zone.bottom - INVALIDATION_BUFFER) {
+      return null;
+    }
+
+    if (!bull && c[k].close > zone.top + INVALIDATION_BUFFER) {
+      return null;
+    }
   }
 
-  // Premium / discount filter against the 4H range
   const mid = (zone.top + zone.bottom) / 2;
+
   if (bull && mid > htf.eq) return null;
   if (!bull && mid < htf.eq) return null;
 
-  // Liquidity sweep before the move
   let sweep = false;
+
   for (let k = st.swings.length - 1; k >= 0; k--) {
     const s = st.swings[k];
+
     if (s.index >= o || s.index < o - 40) continue;
+
     if (bull && s.type === "low") {
-      sweep = c[o].low < s.price; // took out the most recent swing low
+      sweep = c[o].low < s.price;
       break;
     }
+
     if (!bull && s.type === "high") {
       sweep = c[o].high > s.price;
       break;
     }
   }
 
-  const overlap = zone.top >= fvg.bottom && zone.bottom <= fvg.top;
+  const overlap = zone.top >= fvg.bottom &&
+    zone.bottom <= fvg.top;
 
   return {
     dir,
@@ -527,7 +586,7 @@ function find15mSetup(htf) {
 }
 
 // ================================================================
-// STEP 3 - 5M: tap the zone, then confirm with a 5M CHoCH/BOS
+// STEP 3 - 5M: RETEST + CONFIRMATION
 // ================================================================
 
 let activePlan = null;
@@ -537,93 +596,142 @@ function killPlan(reason) {
     deadPOIs.add(activePlan.obTime);
     console.log(`[PLAN] Dropped: ${reason}`);
   }
+
   activePlan = null;
 }
 
 function evaluateEntry() {
   const c = candles["5m"];
   const plan = activePlan;
+
   if (!plan || c.length < 30) return null;
 
   const buy = plan.dir === "bullish";
   const z = plan.zone;
 
   const startIdx = c.findIndex(x => x.t >= plan.breakTime);
-  if (startIdx < 0) return null; // no 5M candles after the 15M break yet
+  if (startIdx < 0) return null;
 
-  // Zone broken through on a 5M close -> setup is dead
   for (let i = startIdx; i < c.length; i++) {
-    if (buy ? c[i].close < z.bottom - INVALIDATION_BUFFER : c[i].close > z.top + INVALIDATION_BUFFER) {
+    if (
+      buy
+        ? c[i].close < z.bottom - INVALIDATION_BUFFER
+        : c[i].close > z.top + INVALIDATION_BUFFER
+    ) {
       killPlan("5M closed through the zone");
       return null;
     }
   }
 
-  // The zone must have been tapped recently
   const last = c.length - 1;
   let touchIdx = -1;
-  for (let i = Math.max(startIdx, c.length - TOUCH_LOOKBACK_5M); i <= last; i++) {
+
+  for (
+    let i = Math.max(startIdx, c.length - TOUCH_LOOKBACK_5M);
+    i <= last;
+    i++
+  ) {
     if (c[i].low <= z.top && c[i].high >= z.bottom) {
       touchIdx = i;
       break;
     }
   }
+
   if (touchIdx < 0) return null;
 
-  // Extreme (lowest low for buys / highest high for sells) since the tap
   let extIdx = touchIdx;
+
   for (let i = touchIdx; i <= last; i++) {
-    if (buy ? c[i].low < c[extIdx].low : c[i].high > c[extIdx].high) extIdx = i;
+    if (
+      buy
+        ? c[i].low < c[extIdx].low
+        : c[i].high > c[extIdx].high
+    ) {
+      extIdx = i;
+    }
   }
 
-  // The 5M lower-high (buys) / higher-low (sells) that formed before the extreme
   let level = null;
   let levelIdx = -1;
-  for (let k = extIdx - 1; k >= Math.max(1, touchIdx - 6); k--) {
-    if (buy && c[k].high >= c[k - 1].high && c[k].high >= c[k + 1].high) {
+
+  for (
+    let k = extIdx - 1;
+    k >= Math.max(1, touchIdx - 6);
+    k--
+  ) {
+    if (
+      buy &&
+      c[k].high >= c[k - 1].high &&
+      c[k].high >= c[k + 1].high
+    ) {
       level = c[k].high;
       levelIdx = k;
       break;
     }
-    if (!buy && c[k].low <= c[k - 1].low && c[k].low <= c[k + 1].low) {
+
+    if (
+      !buy &&
+      c[k].low <= c[k - 1].low &&
+      c[k].low <= c[k + 1].low
+    ) {
       level = c[k].low;
       levelIdx = k;
       break;
     }
   }
+
   if (level === null) return null;
 
-  // Confirmation: the latest 5M candle is the first to close beyond that level
   const lc = c[last];
   const prev = c[last - 1];
+
   const confirmed = buy
-    ? lc.close > level && lc.close > lc.open && prev.close <= level
-    : lc.close < level && lc.close < lc.open && prev.close >= level;
+    ? lc.close > level &&
+      lc.close > lc.open &&
+      prev.close <= level
+    : lc.close < level &&
+      lc.close < lc.open &&
+      prev.close >= level;
+
   if (!confirmed || last <= levelIdx) return null;
 
-  // Stop loss beyond the extreme / zone
   const entry = lc.close;
   const ext = buy ? c[extIdx].low : c[extIdx].high;
+
   const sl = buy
     ? Math.min(ext, z.bottom) - SL_BUFFER
     : Math.max(ext, z.top) + SL_BUFFER;
 
   const risk = Math.abs(entry - sl);
+
   if (risk < MIN_SL_USD || risk > MAX_SL_USD) {
-    console.log(`[PLAN] Confirmation seen but stop distance $${risk.toFixed(2)} is outside limits - skipped`);
+    console.log(
+      `[PLAN] Confirmation seen but stop distance $${risk.toFixed(2)} is outside limits - skipped`
+    );
     return null;
   }
 
-  // Take profit = nearest swing liquidity at least MIN_RR away (15M and 4H swings),
-  // otherwise a fixed MIN_RR target.
-  const htfSwings = getHTF() ? getHTF().swings.map(s => s.price) : [];
-  const ltfSwings = analyzeStructure(candles["15m"], SWING_LOOKBACK["15m"]).swings.map(s => s.price);
-  const levels = [...htfSwings, ...ltfSwings]
-    .filter(p => (buy ? p > entry : p < entry))
-    .sort((a, b2) => (buy ? a - b2 : b2 - a));
+  const htf = getHTF();
 
-  let tp = buy ? entry + MIN_RR * risk : entry - MIN_RR * risk;
+  const htfSwings = htf
+    ? htf.swings.map(s => s.price)
+    : [];
+
+  const ltfSwings = analyzeStructure(
+    candles["15m"],
+    SWING_LOOKBACK["15m"]
+  ).swings.map(s => s.price);
+
+  const levels = [...htfSwings, ...ltfSwings]
+    .filter(p => buy ? p > entry : p < entry)
+    .sort((a, b2) => buy ? a - b2 : b2 - a);
+
+  let tp = buy
+    ? entry + MIN_RR * risk
+    : entry - MIN_RR * risk;
+
   let tpType = `fixed ${MIN_RR}R`;
+
   for (const p of levels) {
     if (Math.abs(p - entry) / risk >= MIN_RR) {
       tp = p;
@@ -645,7 +753,7 @@ function evaluateEntry() {
 }
 
 // ================================================================
-// MAIN ANALYSIS - runs after every successful data refresh
+// MAIN ANALYSIS
 // ================================================================
 
 let htfState = null;
@@ -664,20 +772,33 @@ function analyze() {
 
   if (hasOpenSignal()) return;
 
-  if (activePlan && activePlan.dir !== htfState.bias) killPlan("4H bias changed");
-  if (activePlan && Date.now() - activePlan.createdAt > PLAN_EXPIRY_MS) killPlan("plan expired");
+  if (activePlan && activePlan.dir !== htfState.bias) {
+    killPlan("1H bias changed");
+  }
+
+  if (
+    activePlan &&
+    Date.now() - activePlan.createdAt > PLAN_EXPIRY_MS
+  ) {
+    killPlan("plan expired");
+  }
 
   if (!activePlan) {
     activePlan = find15mSetup(htfState);
+
     if (activePlan) {
       const p = activePlan;
-      console.log(`[PLAN] ${p.dir} ${p.label} on 15M | zone ${p.zone.bottom.toFixed(2)}-${p.zone.top.toFixed(2)} | sweep: ${p.sweep}`);
+
+      console.log(
+        `[PLAN] ${p.dir} ${p.label} on 15M | zone ${p.zone.bottom.toFixed(2)}-${p.zone.top.toFixed(2)} | sweep: ${p.sweep}`
+      );
     }
   }
 
   if (!activePlan) return;
 
   const sig = evaluateEntry();
+
   if (sig) fireSignal(sig);
 }
 
@@ -698,13 +819,18 @@ function fireSignal(sig) {
 
   if (SESSION_FILTER) {
     const h = new Date().getUTCHours();
+
     if (h < SESSION_START_UTC || h >= SESSION_END_UTC) {
       console.log("[SIGNAL] Skipped - outside London/New York session");
       return;
     }
   }
 
-  if (c5.length === 0 || Date.now() - (c5[c5.length - 1].t + TF["5m"].ms) > 15 * 60 * 1000) {
+  if (
+    c5.length === 0 ||
+    Date.now() - (c5[c5.length - 1].t + TF["5m"].ms) >
+      15 * 60 * 1000
+  ) {
     console.log("[SIGNAL] Skipped - 5M data is stale");
     return;
   }
@@ -722,6 +848,7 @@ function fireSignal(sig) {
   const side = buy ? "discount" : "premium";
 
   const confluences = [];
+
   if (plan.sweep) confluences.push("liquidity sweep");
   if (plan.overlap) confluences.push("OB + FVG overlap");
 
@@ -736,13 +863,15 @@ ${emoji} ${direction} @ ${sig.entry.toFixed(2)}
 ⚖️ Risk:Reward 1:${sig.rr.toFixed(1)} (${sig.tpType})
 
 🧭 Top-down analysis
-• 📈 4H: ${plan.dir.toUpperCase()} bias, entry zone in ${side}
+• 📈 1H: ${plan.dir.toUpperCase()} bias, entry zone in ${side}
 • 🟦 15M: ${plan.label} ${plan.dir} + FVG, Order Block ${plan.zone.bottom.toFixed(2)}-${plan.zone.top.toFixed(2)}${confluences.length ? " (" + confluences.join(", ") + ")" : ""}
 • ✅ 5M: price tapped the zone, then ${sig.ltfLabel}
 
 ⚠️ Always manage your own risk. This is not financial advice.`;
 
-  console.log(`[SIGNAL FIRED] ${direction} @ ${sig.entry} SL ${sig.sl} TP ${sig.tp}`);
+  console.log(
+    `[SIGNAL FIRED] ${direction} @ ${sig.entry} SL ${sig.sl} TP ${sig.tp}`
+  );
 
   signalHistory.unshift({
     id: `${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -756,17 +885,23 @@ ${emoji} ${direction} @ ${sig.entry.toFixed(2)}
     closedAt: null,
     closePrice: null
   });
-  if (signalHistory.length > MAX_SIGNAL_HISTORY) signalHistory.pop();
+
+  if (signalHistory.length > MAX_SIGNAL_HISTORY) {
+    signalHistory.pop();
+  }
 
   for (const chatId of subscribers.keys()) {
     bot.sendMessage(chatId, message).catch(err => {
-      console.error(`Failed to send signal to ${chatId}:`, err.message);
+      console.error(
+        `Failed to send signal to ${chatId}:`,
+        err.message
+      );
     });
   }
 }
 
 // ================================================================
-// OUTCOME TRACKER (live price, every 30 seconds)
+// OUTCOME TRACKER
 // ================================================================
 
 function checkOpenSignals(currentPrice) {
@@ -797,7 +932,9 @@ function checkOpenSignals(currentPrice) {
     lastSignalTime = Date.now();
 
     const resultEmoji = signal.status === "win" ? "✅" : "❌";
-    const resultText = signal.status === "win" ? "TAKE PROFIT HIT" : "STOP LOSS HIT";
+    const resultText = signal.status === "win"
+      ? "TAKE PROFIT HIT"
+      : "STOP LOSS HIT";
 
     const closeMessage =
 `${resultEmoji} SIGNAL CLOSED - ${resultText}
@@ -834,11 +971,11 @@ function statusText() {
   const lines = [];
 
   if (!htfState) {
-    lines.push("⏳ Loading 4H data...");
+    lines.push("⏳ Loading 1H data...");
   } else if (!htfState.bias) {
-    lines.push("📈 4H bias: not clear yet");
+    lines.push("📈 1H bias: not clear yet");
   } else {
-    lines.push(`📈 4H bias: ${htfState.bias.toUpperCase()}`);
+    lines.push(`📈 1H bias: ${htfState.bias.toUpperCase()}`);
   }
 
   if (activePlan) {
@@ -847,7 +984,7 @@ function statusText() {
     lines.push(`🟦 Watching zone ${p.zone.bottom.toFixed(2)} - ${p.zone.top.toFixed(2)}`);
     lines.push("⏳ Waiting for a 5M tap and confirmation");
   } else if (htfState && htfState.bias) {
-    lines.push("🔎 15M: no setup in line with the 4H bias yet");
+    lines.push("🔎 15M: no setup in line with the 1H bias yet");
   }
 
   if (hasOpenSignal()) lines.push("📌 A signal is currently open");
@@ -953,7 +1090,7 @@ app.get("/admin", requireAdminAuth, (req, res) => {
   <div class="stats">
     <div class="card"><div class="label">Bot uptime</div><div class="value">${formatUptime(Date.now() - botStartedAt)}</div></div>
     <div class="card"><div class="label">Last 5M close</div><div class="value">${price ? price.toFixed(2) : "—"}</div></div>
-    <div class="card"><div class="label">4H bias</div><div class="value">${bias}</div></div>
+    <div class="card"><div class="label">1H bias</div><div class="value">${bias}</div></div>
     <div class="card"><div class="label">Subscribers</div><div class="value">${subscribers.size}</div></div>
     <div class="card"><div class="label">Signals sent</div><div class="value">${signalHistory.length}</div></div>
   </div>
@@ -966,7 +1103,7 @@ app.get("/admin", requireAdminAuth, (req, res) => {
   </div>
 
   <div class="stats">
-    <div class="card"><div class="label">4H / 15M / 5M candles</div><div class="value">${candles["4h"].length} / ${candles["15m"].length} / ${candles["5m"].length}</div></div>
+    <div class="card"><div class="label">1H / 15M / 5M candles</div><div class="value">${candles["1h"].length} / ${candles["15m"].length} / ${candles["5m"].length}</div></div>
     <div class="card"><div class="label">Credits used today</div><div class="value">${creditsUsed} / 800</div></div>
   </div>
 
@@ -1023,7 +1160,7 @@ app.post("/admin/broadcast", requireAdminAuth, async (req, res) => {
 
 // ================================================================
 // ON-DEMAND CHART DATA  (any pair, any timeframe - chart only)
-// XAU/USD on 5m / 15m / 4H comes from the bot's own data (no credits).
+// XAU/USD on 5m / 15m / 1h comes from the bot's own data (no credits).
 // Everything else is fetched when you open it and cached, with a
 // daily cap so it can never use up the Twelve Data credits.
 // ================================================================
@@ -1121,7 +1258,7 @@ app.get("/api/chart", requireAdminAuth, async (req, res) => {
     const symbol = String(req.query.symbol || SYMBOL).toUpperCase().trim();
     const tf = String(req.query.tf || "5m").toLowerCase().trim();
 
-    if (!/^[A-Z]{2,6}\/[A-Z]{2,6}$/.test(symbol)) {
+    if (!/^[A-Z]{2,6}\\/[A-Z]{2,6}$/.test(symbol)) {
       return res.json({ error: "Use a pair like EUR/USD.", candles: [] });
     }
     if (!CHART_TFS[tf]) {
@@ -1329,12 +1466,12 @@ async function buildPanelData() {
     candles: {
       "5m": pack(candles["5m"]),
       "15m": pack(candles["15m"]),
-      "4h": pack(candles["4h"])
+      "1h": pack(candles["1h"])
     },
     structure: {
       "5m": structureFor("5m"),
       "15m": structureFor("15m"),
-      "4h": structureFor("4h")
+      "1h": structureFor("1h")
     },
     signals: signalHistory.slice(0, 15).map(s => ({
       time: s.time,
@@ -1358,7 +1495,7 @@ async function buildPanelData() {
       lastFetch: {
         "5m": lastFetchOk["5m"] || 0,
         "15m": lastFetchOk["15m"] || 0,
-        "4h": lastFetchOk["4h"] || 0
+        "1h": lastFetchOk["1h"] || 0
       },
       wins: signalHistory.filter(s => s.status === "win").length,
       losses: signalHistory.filter(s => s.status === "loss").length
@@ -1497,8 +1634,8 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
 
 <script>
 (function () {
-  var MS = { "1m": 60000, "5m": 300000, "15m": 900000, "30m": 1800000, "1h": 3600000, "4h": 14400000, "1d": 86400000, "1w": 604800000 };
-  var TFS = [["1m", "1m"], ["5m", "5m"], ["15m", "15m"], ["30m", "30m"], ["1h", "1h"], ["4h", "4H"], ["1d", "1D"], ["1w", "1W"]];
+  var MS = { "1m": 60000, "5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000, "1d": 86400000, "1w": 604800000 };
+  var TFS = [["1m", "1m"], ["5m", "5m"], ["15m", "15m"], ["30m", "30m"], ["1h", "1H"], ["4h", "4H"], ["1d", "1D"], ["1w", "1W"]];
   var GOLD = "XAU/USD";
   var DEF_PAIRS = ["XAU/USD", "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY", "XAG/USD", "BTC/USD", "ETH/USD"];
   var IND_DEF = {
@@ -1598,6 +1735,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     ema: function (a, p) {
       var k = 2 / (p + 1), out = [], e = null, cnt = 0;
       for (var i = 0; i < a.length; i++) {
+
         var v = a[i];
         if (v === null || v === undefined || isNaN(v)) { out.push(null); continue; }
         cnt++;
@@ -1798,206 +1936,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
         text: b.type
       });
     });
-    botData.signals.forEach(function (s) {
-      var m = MS[cfg.tf];
-      var t0 = Math.floor(s.time / m) * m;
-      if (t0 >= first && t0 <= last) {
-        out.push({
-          time: t0 / 1000 + TZ,
-          position: s.dir === "BUY" ? "belowBar" : "aboveBar",
-          color: "#f5c542",
-          shape: s.dir === "BUY" ? "arrowUp" : "arrowDown",
-          text: s.dir
-        });
-      }
-      if (s.closedAt) {
-        var t1 = Math.floor(s.closedAt / m) * m;
-        if (t1 >= first && t1 <= last) {
-          out.push({
-            time: t1 / 1000 + TZ,
-            position: s.dir === "BUY" ? "aboveBar" : "belowBar",
-            color: s.status === "win" ? "#26a69a" : "#ef5350",
-            shape: "circle",
-            text: s.status === "win" ? "TP" : "SL"
-          });
-        }
-      }
-    });
-    out.sort(function (a, b) { return a.time - b.time; });
-    return out;
-  }
 
-  function buildZones(cs) {
-    zones = [];
-    if (!cs.length || !botData || !isGold()) return;
-    var firstT = cs[0].t;
-    var tEnd = cs[cs.length - 1].t + MS[cfg.tf] * 60;
-    var h = botData.htf;
-    if (h && h.eq) {
-      zones.push({ t1: firstT, t2: tEnd, top: h.rangeHigh, bottom: h.eq, fill: "rgba(239,83,80,0.07)", stroke: null, label: "PREMIUM" });
-      zones.push({ t1: firstT, t2: tEnd, top: h.eq, bottom: h.rangeLow, fill: "rgba(38,166,154,0.07)", stroke: null, label: "DISCOUNT" });
-    }
-    var p = botData.plan;
-    if (p) {
-      var buy = p.dir === "bullish";
-      zones.push({
-        t1: p.obTime, t2: tEnd, top: p.zoneTop, bottom: p.zoneBottom,
-        fill: buy ? "rgba(38,166,154,0.30)" : "rgba(239,83,80,0.30)",
-        stroke: buy ? "#26a69a" : "#ef5350",
-        label: "15M OB " + (buy ? "BUY" : "SELL") + " zone"
-      });
-      if (p.fvgTop !== null && p.fvgTop !== undefined) {
-        zones.push({
-          t1: p.obTime, t2: tEnd, top: p.fvgTop, bottom: p.fvgBottom,
-          fill: "rgba(245,197,66,0.18)", stroke: "#f5c542", label: "15M FVG"
-        });
-      }
-    }
-  }
-
-  // ---------------- indicators ----------------
-  function setCErr(t) { var e = $("cErr"); if (e) e.textContent = t || ""; }
-
-  function clearInd() {
-    for (var i = 0; i < indSeries.length; i++) {
-      try { chart.removeSeries(indSeries[i]); } catch (e) { }
-    }
-    indSeries = [];
-  }
-
-  function lineData(cs, vals) {
-    var out = [];
-    for (var i = 0; i < cs.length; i++) {
-      var v = vals[i];
-      if (v !== null && v !== undefined && isFinite(v)) out.push({ time: cs[i].t / 1000 + TZ, value: v });
-    }
-    return out;
-  }
-
-  function addLine(cs, vals, color, scaleId) {
-    var opt = { color: color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false };
-    if (scaleId) opt.priceScaleId = scaleId;
-    var s = chart.addLineSeries(opt);
-    s.setData(lineData(cs, vals));
-    indSeries.push(s);
-    return s;
-  }
-
-  function runCustom(cs, o, h, l, c, t) {
-    var cc = cfg.custom;
-    if (!cc || !cc.on || !cc.code) { setCErr(""); return null; }
-    try {
-      var fn = new Function("o", "h", "l", "c", "t", "ta", cc.code);
-      var res = fn(o, h, l, c, t, ta);
-      var lines = [];
-      var colors = ["#f5c542", "#00bcd4", "#e91e63", "#8bc34a"];
-      var pane = false;
-      if (Array.isArray(res)) {
-        lines = [res];
-      } else if (res && Array.isArray(res.lines)) {
-        lines = res.lines;
-        if (Array.isArray(res.colors)) colors = res.colors.concat(colors);
-        pane = !!res.pane;
-      } else {
-        throw new Error("Return an array, or an object like {lines: [...], pane: true}");
-      }
-      var out = [];
-      for (var i = 0; i < lines.length; i++) {
-        if (!Array.isArray(lines[i])) throw new Error("Each line must be an array with one value per candle");
-        out.push({ vals: lines[i], color: colors[i % colors.length] });
-      }
-      setCErr("Running: " + out.length + " line(s)");
-      return { lines: out, pane: pane };
-    } catch (e) {
-      setCErr("Error: " + e.message);
-      return null;
-    }
-  }
-
-  function applyIndicators(cs) {
-    clearInd();
-    if (!cs.length || !chart) return;
-    var o = [], h = [], l = [], c = [], t = [];
-    for (var i = 0; i < cs.length; i++) { o.push(cs[i].o); h.push(cs[i].h); l.push(cs[i].l); c.push(cs[i].c); t.push(cs[i].t); }
-    var I = cfg.ind;
-
-    if (I.sma.on) addLine(cs, ta.sma(c, I.sma.p), "#f5c542");
-    if (I.ema1.on) addLine(cs, ta.ema(c, I.ema1.p), "#2962ff");
-    if (I.ema2.on) addLine(cs, ta.ema(c, I.ema2.p), "#ff6d00");
-    if (I.bb.on) {
-      var mid = ta.sma(c, I.bb.p);
-      var sd = ta.stdev(c, I.bb.p);
-      var up = [], lo = [];
-      for (var k = 0; k < c.length; k++) {
-        up.push(mid[k] === null ? null : mid[k] + I.bb.m * sd[k]);
-        lo.push(mid[k] === null ? null : mid[k] - I.bb.m * sd[k]);
-      }
-      addLine(cs, mid, "#787b86");
-      addLine(cs, up, "#2962ff");
-      addLine(cs, lo, "#2962ff");
-    }
-
-    var custom = runCustom(cs, o, h, l, c, t);
-    if (custom && !custom.pane) {
-      custom.lines.forEach(function (ln) { addLine(cs, ln.vals, ln.color); });
-    }
-
-    var panes = [];
-    if (I.rsi.on) {
-      panes.push(function (id) {
-        var s = addLine(cs, ta.rsi(c, I.rsi.p), "#b388ff", id);
-        s.createPriceLine({ price: 70, color: "#787b86", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "" });
-        s.createPriceLine({ price: 30, color: "#787b86", lineWidth: 1, lineStyle: 2, axisLabelVisible: false, title: "" });
-      });
-    }
-    if (I.macd.on) {
-      panes.push(function (id) {
-        var fast = ta.ema(c, I.macd.f);
-        var slow = ta.ema(c, I.macd.s);
-        var m = [];
-        for (var k = 0; k < c.length; k++) m.push(fast[k] === null || slow[k] === null ? null : fast[k] - slow[k]);
-        var sg = ta.ema(m, I.macd.g);
-        var hist = [];
-        for (var q = 0; q < c.length; q++) {
-          if (m[q] !== null && sg[q] !== null) hist.push({ time: cs[q].t / 1000 + TZ, value: m[q] - sg[q], color: (m[q] - sg[q]) >= 0 ? "rgba(38,166,154,0.6)" : "rgba(239,83,80,0.6)" });
-        }
-        var hs = chart.addHistogramSeries({ priceScaleId: id, priceLineVisible: false, lastValueVisible: false });
-        hs.setData(hist);
-        indSeries.push(hs);
-        addLine(cs, m, "#2962ff", id);
-        addLine(cs, sg, "#ff6d00", id);
-      });
-    }
-    if (custom && custom.pane) {
-      panes.push(function (id) {
-        custom.lines.forEach(function (ln) { addLine(cs, ln.vals, ln.color, id); });
-      });
-    }
-
-    var n = panes.length;
-    chart.priceScale("right").applyOptions({ scaleMargins: { top: 0.06, bottom: n ? Math.min(0.62, 0.04 + 0.2 * n) : 0.06 } });
-    for (var p = 0; p < n; p++) {
-      var id = "pane" + p;
-      panes[p](id);
-      var bottom = 0.2 * p + 0.01;
-      chart.priceScale(id).applyOptions({ scaleMargins: { top: Math.max(0.05, 1 - bottom - 0.17), bottom: bottom } });
-    }
-  }
-
-  // ---------------- chart render ----------------
-  function render() {
-    if (!series) return;
-    var cs = candlesOf();
-    $("msg").style.display = cs.length ? "none" : "block";
-    if (!cs.length) $("msg").textContent = cur.error ? cur.error : "Loading candles...";
-
-    var key = cfg.symbol + ":" + cfg.tf + ":" + cs.length + ":" + (cs.length ? cs[cs.length - 1].t : 0);
-    if (key !== sig) {
-      sig = key;
-      var pr = precisionFor(cs.length ? cs[cs.length - 1].c : 1000);
-      series.applyOptions({ priceFormat: { type: "price", precision: pr, minMove: Math.pow(10, -pr) } });
-      chart.applyOptions({ timeScale: { timeVisible: MS[cfg.tf] < 86400000 } });
-      series.setData(cs.map(function (x) {
         return { time: x.t / 1000 + TZ, open: x.o, high: x.h, low: x.l, close: x.c };
       }));
       if (needFit && cs.length) {
@@ -2032,7 +1971,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     }
     if (isGold() && botData) {
       if (botData.price) pl(botData.price, "#ffffff", "live", 2);
-      if (cfg.zones && botData.htf && botData.htf.eq) pl(botData.htf.eq, "#b388ff", "4H 50%", 2);
+      if (cfg.zones && botData.htf && botData.htf.eq) pl(botData.htf.eq, "#b388ff", "1H 50%", 2);
       var os = openSignalOf(botData);
       if (os) {
         pl(os.entry, "#9e9e9e", "entry", 0);
@@ -2131,8 +2070,8 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     if (gold && botData) {
       var h = botData.htf;
       var p = botData.plan;
-      if (h && h.bias) f += chip("4H " + h.bias.toUpperCase() + (h.zone ? " - " + h.zone : ""), h.bias === "bullish" ? "up" : "down");
-      else f += chip("4H bias unclear", "dim");
+      if (h && h.bias) f += chip("1H " + h.bias.toUpperCase() + (h.zone ? " - " + h.zone : ""), h.bias === "bullish" ? "up" : "down");
+      else f += chip("1H bias unclear", "dim");
       var os = openSignalOf(botData);
       if (os) f += chip("Signal open: " + os.dir, "warn");
       else if (p) f += chip("Watching " + (p.dir === "bullish" ? "buy" : "sell") + " zone " + num(p.zoneBottom) + "-" + num(p.zoneTop), "warn");
@@ -2154,11 +2093,11 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
 
     var html = '<div class="card"><h3>Top-down check (XAU/USD)</h3>';
 
-    html += row("1&#65039;&#8419; 4H bias", h && h.bias
+    html += row("1&#65039;&#8419; 1H bias", h && h.bias
       ? '<b class="' + (h.bias === "bullish" ? "up" : "down") + '">' + h.bias.toUpperCase() + '</b>'
       : '<span class="dim">not clear yet</span>');
     if (h) {
-      html += row("4H range", num(h.rangeLow) + " - " + num(h.rangeHigh));
+      html += row("1H range", num(h.rangeLow) + " - " + num(h.rangeHigh));
       html += row("50% level", num(h.eq));
       html += row("Price is in", h.zone ? (h.zone === "discount" ? '<span class="up">DISCOUNT (buys)</span>' : '<span class="down">PREMIUM (sells)</span>') : "--");
     }
@@ -2171,7 +2110,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       html += row("Liquidity sweep", p.sweep ? '<span class="up">yes &#10003;</span>' : '<span class="dim">no (bonus only)</span>');
       html += row("OB + FVG overlap", p.overlap ? '<span class="up">yes &#10003;</span>' : '<span class="dim">no</span>');
     } else {
-      html += row("2&#65039;&#8419; 15M setup", '<span class="dim">searching - no break in the 4H direction yet</span>');
+      html += row("2&#65039;&#8419; 15M setup", '<span class="dim">searching - no break in the 1H direction yet</span>');
     }
 
     if (p && pr) {
@@ -2187,7 +2126,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     html += keyBox("#26a69a", "Green box: 15M buy zone (order block)");
     html += keyBox("#ef5350", "Red box: 15M sell zone (order block)");
     html += keyBox("#f5c542", "Yellow box: 15M fair value gap");
-    html += keyBox("#b388ff", "Purple line: 4H 50% level (above = premium, below = discount)");
+    html += keyBox("#b388ff", "Purple line: 1H 50% level (above = premium, below = discount)");
     html += keyBox("#ffffff", "White dashed line: live price");
     html += keyBox("#787b86", "Arrows: BOS / CHoCH structure breaks and signals");
     html += '</div>';
@@ -2328,7 +2267,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
     html += '<div id="dataCard"></div>';
 
     html += '<div class="card"><h3>Strategy (XAU/USD)</h3>';
-    html += row("Flow", "4H bias &#8594; 15M zone &#8594; 5M entry");
+    html += row("Flow", "1H bias &#8594; 15M zone &#8594; 5M entry");
     html += row("Minimum reward : risk", "1 : 2");
     html += row("Signal hours", localHour(7) + " - " + localHour(20) + " (your time)");
     html += row("One signal at a time", "yes");
@@ -2348,7 +2287,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       html += row("Gold market", s.marketClosed ? '<span class="warn">closed</span>' : '<span class="up">open</span>');
       html += row("5M candles updated", ago(s.lastFetch["5m"]));
       html += row("15M candles updated", ago(s.lastFetch["15m"]));
-      html += row("4H candles updated", ago(s.lastFetch["4h"]));
+      html += row("1H candles updated", ago(s.lastFetch["1h"]));
       html += row("Twelve Data credits used today", s.creditsUsed + " / 800");
       html += row("Extra chart loads today", s.onDemandUsed + " / " + s.onDemandCap);
     } else {
@@ -2398,6 +2337,7 @@ const PANEL_HTML = String.raw`<!DOCTYPE html>
       }
       cfg.custom = { code: "", on: false };
       saveCfg();
+
       indSig = "";
       renderIndicators();
       render();
@@ -2617,7 +2557,7 @@ ${statusText()}
 
 📩 You will receive an alert when a full top-down setup is confirmed:
 
-🧭 4H bias
+🧭 1H bias
 🟦 15M structure break + Order Block + FVG
 ✅ 5M tap and confirmation
 ⚖️ At least 1:2 risk to reward`
@@ -2654,11 +2594,11 @@ ${statusText()}
 
 🧠 The bot analyses XAUUSD top-down, like a Smart Money trader:
 
-1️⃣ 4H - Bias
-📊 Market structure (BOS / CHoCH) sets the direction. Buys only in discount, sells only in premium of the 4H range.
+1️⃣ 1H - Bias
+📊 Market structure (BOS / CHoCH) sets the direction. Buys only in discount, sells only in premium of the 1H range.
 
 2️⃣ 15M - Zone
-🟦 Structure breaks in the 4H direction with displacement (Fair Value Gap). The Order Block behind the move becomes the entry zone.
+🟦 Structure breaks in the 1H direction with displacement (Fair Value Gap). The Order Block behind the move becomes the entry zone.
 
 3️⃣ 5M - Entry
 ✅ Price must return to the zone, then a 5M change of character confirms the entry.
@@ -2683,7 +2623,7 @@ ${statusText()}
 XAUUSD
 
 🧭 Timeframes
-4H bias → 15M zone → 5M entry
+1H bias → 15M zone → 5M entry
 
 ⚖️ Minimum risk:reward
 1:${MIN_RR}
